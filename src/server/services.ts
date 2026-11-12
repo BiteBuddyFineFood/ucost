@@ -1,13 +1,23 @@
 import { Prisma, User } from "@prisma/client";
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
-import { db } from "./db";
+import { db, writeTransaction } from "./db";
+import {
+  attachShoppingSource,
+  invalidateList,
+  groupAction,
+  settlementPreview,
+  checkoutPreview,
+} from "./groups";
+import { aiUsage } from "./ai-gateway";
 import {
   localDate,
   validDate,
   reviewResult,
   savingSplit,
   defaultWidgets,
+  categoryIcons,
+  categoryColors,
 } from "@/lib/domain";
 
 type Tx = Prisma.TransactionClient;
@@ -36,12 +46,14 @@ const listSchema = z.object({
   description: text.default(""),
   archived: z.boolean().default(false),
   sort: z.number().int().default(0),
+  budget: amount.nullish(),
 });
 const shoppingSchema = z.object({
   listId: id,
   name: text.min(1).max(200),
   quantity: text.max(100).default(""),
   budget: amount.nullish(),
+  categoryId: id.nullish(),
   reason: text.default(""),
   requirements: text.default(""),
   concerns: text.default(""),
@@ -81,7 +93,35 @@ const accountSchema = z.object({
 const categorySchema = z.object({
   name: text.min(1).max(40),
   type: z.enum(["income", "expense"]),
+  iconKey: z
+    .enum(Object.keys(categoryIcons) as [string, ...string[]])
+    .default("tag"),
+  color: z
+    .enum(Object.keys(categoryColors) as [string, ...string[]])
+    .nullable()
+    .default("")
+    .transform((value) => value ?? ""),
   archived: z.boolean().default(false),
+});
+const purchaseEditSchema = z.object({
+  amount: amount,
+  date,
+  categoryId: id.nullish(),
+  accountId: id.nullish(),
+  discount: amount.nullish(),
+  discountDetails: text.optional(),
+  syncLedgerCategory: z.boolean().default(true),
+});
+const purchaseRelinkSchema = z.object({
+  amount: amount.positive(),
+  date,
+  categoryId: id.nullish(),
+  accountId: id.nullish(),
+  discount: amount.default(0),
+  discountDetails: text.default(""),
+  planned: amount.nullish(),
+  createItem: z.boolean().default(false),
+  createSaving: z.boolean().default(true),
 });
 const models: Record<string, string> = {
   ledger: "ledgerEntry",
@@ -116,7 +156,7 @@ export async function operation(
   action: (tx: Tx) => Promise<unknown>,
 ) {
   const opId = id.parse(operationId);
-  return db.$transaction(
+  return writeTransaction(
     async (tx) => {
       const exists = await tx.appliedOperation.findUnique({
         where: { id: opId },
@@ -136,6 +176,165 @@ export async function operation(
   );
 }
 
+async function defaultExpenseAccount(tx: Tx, ownerId: string) {
+  const user = await tx.user.findUnique({
+    where: { id: ownerId },
+    select: { defaultExpenseAccountId: true },
+  });
+  if (!user?.defaultExpenseAccountId) return null;
+  const account = await tx.account.findFirst({
+    where: {
+      id: user.defaultExpenseAccountId,
+      ownerId,
+      archived: false,
+    },
+  });
+  return account?.id ?? null;
+}
+
+async function expenseAccount(
+  tx: Tx,
+  ownerId: string,
+  value: unknown,
+  omittedUsesDefault: boolean,
+) {
+  if (value === undefined && omittedUsesDefault)
+    return defaultExpenseAccount(tx, ownerId);
+  if (value == null || value === "") return null;
+  const accountId = id.parse(value);
+  const account = await owned(tx, "account", accountId, ownerId);
+  if (account.archived) throw new Error("账户已归档，请选择可用账户");
+  return account.id;
+}
+
+async function expenseCategory(
+  tx: Tx,
+  ownerId: string,
+  value: unknown,
+  existingCategoryId?: string | null,
+) {
+  if (value == null || value === "") return null;
+  const categoryId = id.parse(value);
+  const category = await owned(tx, "category", categoryId, ownerId);
+  if (category.type !== "expense") throw new Error("购物只能使用支出分类");
+  if (category.archived && category.id !== existingCategoryId)
+    throw new Error("分类已归档，请选择可用分类");
+  return category.id;
+}
+
+async function upsertShoppingSaving(
+  tx: Tx,
+  ownerId: string,
+  item: any,
+  values: {
+    type: "skipped" | "downgrade";
+    date: string;
+    planned: number;
+    actual: number;
+    amount: number;
+  },
+) {
+  if (values.amount <= 0) return;
+  const sourceKey = `shopping:${item.id}:${values.type === "skipped" ? "skip" : "downgrade"}`;
+  const previous = await tx.savingEntry.findUnique({ where: { sourceKey } });
+  if (previous && previous.ownerId !== ownerId) throw new Error("省钱来源冲突");
+  const data = {
+    title: item.name,
+    type: values.type,
+    source: "shopping",
+    date: values.date,
+    planned: values.planned,
+    actual: values.actual,
+    amount: values.amount,
+    shoppingItemId: item.id,
+    status: "valid",
+    suppressed: previous?.suppressed ?? false,
+  };
+  if (previous)
+    await tx.savingEntry.update({
+      where: { id: previous.id },
+      data: { ...data, version: { increment: 1 } },
+    });
+  else
+    await tx.savingEntry.create({
+      data: { ...data, ownerId, sourceKey },
+    });
+}
+
+async function syncShoppingSaving(
+  tx: Tx,
+  ownerId: string,
+  item: any,
+  paid: number,
+  discount: number,
+  onDate: string,
+) {
+  const savings = await tx.savingEntry.findMany({
+    where: { ownerId, shoppingItemId: item.id, source: "shopping" },
+  });
+  const refunds = item.ledgerId
+    ? await tx.ledgerEntry.aggregate({
+        where: { ownerId, refundOfId: item.ledgerId },
+        _sum: { amount: true },
+      })
+    : null;
+  const refunded = refunds?._sum.amount ?? 0;
+  for (const saving of savings) {
+    if (saving.type !== "downgrade") continue;
+    const planned = saving.planned ?? item.budget;
+    if (!planned) continue;
+    const amount = planned - paid - discount;
+    if (amount <= 0) {
+      await tx.savingEntry.delete({ where: { id: saving.id } });
+      continue;
+    }
+    await tx.savingEntry.update({
+      where: { id: saving.id },
+      data: {
+        planned,
+        actual: paid + discount,
+        amount,
+        date: onDate,
+        status:
+          !item.ledgerId || refunded >= paid
+            ? "revoked"
+            : refunded > 0
+              ? "pending"
+              : "valid",
+        version: { increment: 1 },
+      },
+    });
+  }
+}
+
+async function linkOwnedItem(
+  tx: Tx,
+  ownerId: string,
+  item: any,
+  entry: any,
+  createItem: boolean,
+) {
+  if (item.ownedItemId) {
+    const asset = await owned(tx, "ownedItem", item.ownedItemId, ownerId);
+    return tx.ownedItem.update({
+      where: { id: asset.id },
+      data: {
+        ledgerId: entry.id,
+        price: entry.amount,
+        version: { increment: 1 },
+      },
+    });
+  }
+  if (!createItem) return null;
+  return saveEntity(tx, ownerId, "items", {
+    name: item.name,
+    purchaseDate: entry.date,
+    price: entry.amount,
+    ledgerId: entry.id,
+    note: item.note,
+  });
+}
+
 async function syncDiscount(tx: Tx, ownerId: string, entry: any) {
   const sourceKey = `discount:${entry.orderKey || entry.id}`;
   const previous = await tx.savingEntry.findUnique({ where: { sourceKey } });
@@ -151,6 +350,41 @@ async function syncDiscount(tx: Tx, ownerId: string, entry: any) {
     _sum: { amount: true },
   });
   const refunded = refunds._sum.amount || 0;
+  const shopping = entry.sourceShoppingItemId
+    ? await tx.shoppingItem.findFirst({
+        where: { ownerId, id: entry.sourceShoppingItemId },
+      })
+    : null;
+  if (shopping)
+    await tx.savingEntry.updateMany({
+      where: {
+        ownerId,
+        shoppingItemId: shopping.id,
+        source: "shopping",
+        type: "downgrade",
+        suppressed: false,
+      },
+      data: {
+        status:
+          refunded >= entry.amount
+            ? "revoked"
+            : refunded > 0
+              ? "pending"
+              : "valid",
+        version: { increment: 1 },
+      },
+    });
+  const list = shopping
+    ? await tx.shoppingList.findFirst({
+        where: { ownerId, id: shopping.listId },
+      })
+    : null;
+  const settlement =
+    list?.savingMode === "budget"
+      ? await tx.listSettlement.findFirst({
+          where: { ownerId, listId: list.id },
+        })
+      : null;
   const status =
     !entry.autoSaving || !entry.discount || refunded >= entry.amount
       ? "revoked"
@@ -168,6 +402,13 @@ async function syncDiscount(tx: Tx, ownerId: string, entry: any) {
     amount: entry.discount,
     ledgerId: entry.id,
     status,
+    ...(shopping
+      ? {
+          shoppingItemId: shopping.id,
+          sourceListId: shopping.listId,
+          supersededBySettlementId: settlement?.id ?? null,
+        }
+      : {}),
   };
   if (previous)
     await tx.savingEntry.update({
@@ -175,7 +416,9 @@ async function syncDiscount(tx: Tx, ownerId: string, entry: any) {
       data: { ...values, version: { increment: 1 } },
     });
   else if (entry.discount && entry.autoSaving)
-    await tx.savingEntry.create({ data: { ...values, ownerId, sourceKey } });
+    await tx.savingEntry.create({
+      data: { ...values, ownerId, sourceKey, groupId: entry.groupId },
+    });
 }
 
 export async function saveEntity(
@@ -193,6 +436,14 @@ export async function saveEntity(
   let data: any;
   if (entity === "ledger") {
     data = entrySchema.parse(merged);
+    if (
+      !existing &&
+      data.type === "expense" &&
+      !Object.prototype.hasOwnProperty.call(raw, "accountId")
+    ) {
+      const fallback = await defaultExpenseAccount(tx, ownerId);
+      if (fallback) data.accountId = fallback;
+    }
     if (
       existing &&
       (existing.type !== data.type ||
@@ -235,9 +486,12 @@ export async function saveEntity(
       if ((others._sum.amount || 0) + data.amount > original.amount)
         throw new Error("累计退款不能超过原支出");
       data.categoryId = original.categoryId;
+      if (!existing) data.groupId = original.groupId;
     } else data.refundOfId = null;
     if (data.categoryId) {
       const category = await owned(tx, "category", data.categoryId, ownerId);
+      if (category.archived && category.id !== existing?.categoryId)
+        throw new Error("分类已归档");
       if (category.type !== (data.type === "refund" ? "expense" : data.type))
         throw new Error("分类与收支类型不匹配");
     }
@@ -271,6 +525,14 @@ export async function saveEntity(
     data = shoppingSchema.parse(merged);
     const list = await owned(tx, "shoppingList", data.listId, ownerId);
     if (list.archived) throw new Error("清单已归档，请选择可用清单");
+    if (list.closedAt && !existing)
+      throw new Error("请先重新打开清单，再添加本轮采购物品");
+    data.categoryId = await expenseCategory(
+      tx,
+      ownerId,
+      data.categoryId,
+      existing?.categoryId,
+    );
     if (
       (!existing && ["purchased", "skipped"].includes(data.status)) ||
       (existing &&
@@ -284,6 +546,25 @@ export async function saveEntity(
       data.status !== existing.status
     )
       throw new Error("已完成的购买决定不能直接改回待购");
+    if (
+      existing &&
+      existing.listId !== data.listId &&
+      ["purchased", "skipped"].includes(existing.status)
+    )
+      throw new Error("已完成购买决定不能迁移来源清单，请使用记录组调整展示");
+    if (existing?.ledgerId && data.categoryId !== existing.categoryId) {
+      const entry = await owned(tx, "ledgerEntry", existing.ledgerId, ownerId);
+      if (entry.type !== "expense")
+        throw new Error("关联记录不是支出，无法同步分类");
+      await tx.ledgerEntry.update({
+        where: { id: entry.id },
+        data: { categoryId: data.categoryId, version: { increment: 1 } },
+      });
+      await tx.ledgerEntry.updateMany({
+        where: { ownerId, refundOfId: entry.id },
+        data: { categoryId: data.categoryId, version: { increment: 1 } },
+      });
+    }
   } else if (entity === "items") {
     data = itemSchema.parse(merged);
     if (
@@ -299,7 +580,7 @@ export async function saveEntity(
       data.price = entry.amount;
     }
   } else if (entity === "savings") {
-    if (existing?.source === "automatic") {
+    if (existing && ["automatic", "settlement"].includes(existing.source)) {
       if (
         ["amount", "type", "planned", "actual", "date"].some(
           (key) => raw[key] !== undefined && raw[key] !== existing[key],
@@ -375,6 +656,11 @@ export async function saveEntity(
         date: record.retiredDate || localDate(),
       },
     });
+  if (entity === "accounts" && record.archived)
+    await tx.user.updateMany({
+      where: { id: ownerId, defaultExpenseAccountId: record.id },
+      data: { defaultExpenseAccountId: null },
+    });
   if (entity === "ledger") {
     if (record.type === "expense") await syncDiscount(tx, ownerId, record);
     const parents = new Set(
@@ -388,8 +674,60 @@ export async function saveEntity(
         ownerId,
       );
       await syncDiscount(tx, ownerId, parent);
+      const source =
+        parent.sourceShoppingItemId &&
+        (await tx.shoppingItem.findFirst({
+          where: { id: parent.sourceShoppingItemId, ownerId },
+        }));
+      if (source) await invalidateList(tx, ownerId, source.listId);
+    }
+    if (existing?.sourceShoppingItemId) {
+      const item = await tx.shoppingItem.findFirst({
+        where: { id: existing.sourceShoppingItemId, ownerId },
+      });
+      if (item) {
+        await tx.shoppingItem.update({
+          where: { id: item.id },
+          data: {
+            purchaseAmount: record.amount,
+            purchasedAt: record.date,
+            purchaseAccountId: record.accountId,
+            categoryId: record.categoryId,
+            purchaseDiscount: record.discount,
+            purchaseDiscountDetails: record.discountDetails,
+            purchaseRevision: { increment: 1 },
+            version: { increment: 1 },
+          },
+        });
+        await tx.ownedItem.updateMany({
+          where: { ownerId, ledgerId: record.id },
+          data: {
+            price: record.amount,
+            purchaseDate: record.date,
+            version: { increment: 1 },
+          },
+        });
+        await syncShoppingSaving(
+          tx,
+          ownerId,
+          item,
+          record.amount,
+          record.discount,
+          record.date,
+        );
+        await invalidateList(tx, ownerId, item.listId);
+      }
     }
   }
+  if (entity === "lists" && existing) {
+    await tx.recordGroup.updateMany({
+      where: { ownerId, sourceListId: record.id },
+      data: { name: record.name, version: { increment: 1 } },
+    });
+    if (record.budget !== existing.budget)
+      await invalidateList(tx, ownerId, record.id);
+  }
+  if (entity === "shopping") await invalidateList(tx, ownerId, record.listId);
   return record;
 }
 
@@ -422,12 +760,44 @@ async function deleteEntity(
       where: { ownerId, ledgerId: record.id, source: "automatic" },
       data: { status: "revoked", suppressed: true, version: { increment: 1 } },
     });
-    await tx.shoppingItem.updateMany({
+    const linkedShopping = await tx.shoppingItem.findMany({
       where: { ownerId, ledgerId: record.id },
-      data: { ledgerId: null, version: { increment: 1 } },
     });
+    for (const item of linkedShopping)
+      await invalidateList(tx, ownerId, item.listId);
+    await tx.savingEntry.updateMany({
+      where: {
+        ownerId,
+        shoppingItemId: { in: linkedShopping.map((i) => i.id) },
+        source: "shopping",
+        type: "downgrade",
+      },
+      data: { status: "revoked", version: { increment: 1 } },
+    });
+    for (const item of linkedShopping)
+      await tx.shoppingItem.update({
+        where: { id: item.id },
+        data: {
+          ledgerId: null,
+          categoryId: item.categoryId ?? record.categoryId,
+          purchaseAmount: record.amount,
+          purchasedAt: record.date,
+          purchaseAccountId: record.accountId,
+          purchaseDiscount: record.discount,
+          purchaseDiscountDetails: record.discountDetails,
+          purchaseRevision: { increment: 1 },
+          purchaseNeedsReview:
+            item.purchaseAmount == null ||
+            item.purchasedAt == null ||
+            item.purchaseNeedsReview,
+          version: { increment: 1 },
+        },
+      });
   }
-  if (entity === "savings" && record.source === "automatic") {
+  if (
+    entity === "savings" &&
+    ["automatic", "shopping", "settlement"].includes(record.source)
+  ) {
     await tx.savingEntry.update({
       where: { id: record.id },
       data: { status: "revoked", suppressed: true, version: { increment: 1 } },
@@ -435,12 +805,18 @@ async function deleteEntity(
     return;
   }
   if (entity === "lists") {
+    await invalidateList(tx, ownerId, record.id);
+    await tx.recordGroup.updateMany({
+      where: { ownerId, sourceListId: record.id },
+      data: { sourceDeleted: true, version: { increment: 1 } },
+    });
     const items = await tx.shoppingItem.findMany({
       where: { ownerId, listId: record.id },
     });
     for (const item of items) await deleteEntity(tx, ownerId, "shopping", item);
   }
   if (entity === "shopping") {
+    await invalidateList(tx, ownerId, record.listId);
     await tx.reviewRequest.updateMany({
       where: { ownerId, itemId: record.id },
       data: {
@@ -470,35 +846,68 @@ async function deleteEntity(
   if (entity === "ledger" && record.refundOfId) {
     const parent = await owned(tx, "ledgerEntry", record.refundOfId, ownerId);
     await syncDiscount(tx, ownerId, parent);
+    const source =
+      parent.sourceShoppingItemId &&
+      (await tx.shoppingItem.findFirst({
+        where: { id: parent.sourceShoppingItemId, ownerId },
+      }));
+    if (source) await invalidateList(tx, ownerId, source.listId);
   }
 }
 
 export async function convertShopping(tx: Tx, ownerId: string, body: any) {
   const item = await owned(tx, "shoppingItem", id.parse(body.id), ownerId);
   checkVersion(item, body.version);
-  if (["purchased", "skipped"].includes(item.status)) return item;
+  if (["purchased", "skipped"].includes(item.status)) {
+    if (item.status === "purchased" && !item.ledgerId)
+      throw new Error("这件物品已购未记账，请使用补记账");
+    return item;
+  }
   const list = await owned(tx, "shoppingList", item.listId, ownerId);
   if (list.archived) throw new Error("目标清单已归档，请先恢复清单");
+  if (list.closedAt) throw new Error("请先重新打开清单");
   z.enum(["buy", "skip"]).parse(body.mode);
   const onDate = date.parse(body.date);
   const skip = body.mode === "skip";
-  const paid = skip ? 0 : amount.positive().parse(body.paid);
+  const paid = skip ? 0 : amount.parse(body.paid);
   const discount = skip ? 0 : amount.parse(body.discount ?? 0);
+  if (paid === 0 && discount > 0) throw new Error("零元购买不能产生优惠支出");
+  const categoryId = await expenseCategory(
+    tx,
+    ownerId,
+    body.categoryId === undefined ? item.categoryId : body.categoryId,
+    item.categoryId,
+  );
+  const accountId = skip
+    ? null
+    : await expenseAccount(tx, ownerId, body.accountId, true);
   let entry: any;
-  if (!skip && body.createLedger)
+  if (!skip && body.createLedger && paid > 0)
     entry = await saveEntity(tx, ownerId, "ledger", {
       type: "expense",
       title: item.name,
       amount: paid,
       date: onDate,
+      categoryId,
       discount,
+      discountDetails: body.discountDetails || "",
       grossAmount: paid + discount,
       autoSaving: true,
       note: item.note,
-      accountId: body.accountId || null,
+      accountId,
     });
   let asset: any;
-  if (!skip && body.createItem)
+  if (!skip && item.ownedItemId)
+    await tx.ownedItem.updateMany({
+      where: { ownerId, id: item.ownedItemId },
+      data: {
+        price: paid,
+        purchaseDate: onDate,
+        ledgerId: entry?.id ?? null,
+        version: { increment: 1 },
+      },
+    });
+  if (!skip && body.createItem && !item.ownedItemId)
     asset = await saveEntity(tx, ownerId, "items", {
       name: item.name,
       purchaseDate: onDate,
@@ -513,28 +922,264 @@ export async function convertShopping(tx: Tx, ownerId: string, body: any) {
     const split = skip
       ? { downgrade: planned }
       : savingSplit(planned, paid, discount);
-    if (split.downgrade > 0)
-      await tx.savingEntry.create({
-        data: {
-          ownerId,
-          title: item.name,
-          type: skip ? "skipped" : "downgrade",
-          source: "shopping",
-          date: onDate,
-          planned,
-          actual: skip ? 0 : paid + discount,
-          amount: split.downgrade,
-          shoppingItemId: item.id,
-          sourceKey: `shopping:${item.id}:${skip ? "skip" : "downgrade"}`,
-        },
-      });
+    await upsertShoppingSaving(tx, ownerId, item, {
+      type: skip ? "skipped" : "downgrade",
+      date: onDate,
+      planned,
+      actual: skip ? 0 : paid + discount,
+      amount: split.downgrade,
+    });
   }
+  await attachShoppingSource(tx, ownerId, item, entry?.id);
   return tx.shoppingItem.update({
     where: { id: item.id },
     data: {
       status: skip ? "skipped" : "purchased",
       ledgerId: entry?.id,
-      ownedItemId: asset?.id,
+      ownedItemId: asset?.id ?? item.ownedItemId,
+      categoryId,
+      purchaseAmount: skip ? null : paid,
+      purchasedAt: skip ? null : onDate,
+      purchaseAccountId: skip ? null : accountId,
+      purchaseDiscount: skip ? null : discount,
+      purchaseDiscountDetails: skip ? "" : body.discountDetails || "",
+      purchaseRevision: { increment: 1 },
+      purchaseNeedsReview: false,
+      version: { increment: 1 },
+    },
+  });
+}
+
+export async function purchaseEdit(tx: Tx, ownerId: string, body: any) {
+  const item = await owned(tx, "shoppingItem", id.parse(body.id), ownerId);
+  checkVersion(item, body.version);
+  if (item.status !== "purchased")
+    throw new Error("只有已购买的物品可以修改购买信息");
+  const parsed = purchaseEditSchema.parse(body);
+  const entry = item.ledgerId
+    ? await owned(tx, "ledgerEntry", item.ledgerId, ownerId)
+    : null;
+  if (entry && entry.type !== "expense")
+    throw new Error("关联记录不是支出，无法修改购买信息");
+  if (entry && parsed.amount <= 0)
+    throw new Error("有账单的购买金额必须大于 0");
+  const categoryId = await expenseCategory(
+    tx,
+    ownerId,
+    parsed.categoryId === undefined ? item.categoryId : parsed.categoryId,
+    item.categoryId,
+  );
+  const accountId =
+    parsed.accountId === undefined
+      ? (item.purchaseAccountId ?? null)
+      : await expenseAccount(tx, ownerId, parsed.accountId, false);
+  const discountValue =
+    parsed.discount ?? item.purchaseDiscount ?? entry?.discount ?? 0;
+  const discountDetails =
+    parsed.discountDetails ??
+    item.purchaseDiscountDetails ??
+    entry?.discountDetails ??
+    "";
+  if (entry) {
+    const refunds = await tx.ledgerEntry.findMany({
+      where: { ownerId, refundOfId: entry.id },
+    });
+    if (refunds.reduce((sum, row) => sum + row.amount, 0) > parsed.amount)
+      throw new Error("购买金额不能小于已退款合计");
+    if (refunds.some((row) => row.date < parsed.date))
+      throw new Error("购买日期不能晚于关联退款");
+    const nextCategoryId = parsed.syncLedgerCategory
+      ? categoryId
+      : entry.categoryId;
+    const updatedEntry = await tx.ledgerEntry.update({
+      where: { id: entry.id },
+      data: {
+        amount: parsed.amount,
+        date: parsed.date,
+        accountId,
+        categoryId: nextCategoryId,
+        discount: discountValue,
+        grossAmount: parsed.amount + discountValue,
+        discountDetails,
+        version: { increment: 1 },
+      },
+    });
+    if (nextCategoryId !== entry.categoryId)
+      await tx.ledgerEntry.updateMany({
+        where: { ownerId, refundOfId: entry.id },
+        data: { categoryId: nextCategoryId, version: { increment: 1 } },
+      });
+    if (item.ownedItemId)
+      await tx.ownedItem.updateMany({
+        where: { ownerId, id: item.ownedItemId },
+        data: {
+          price: parsed.amount,
+          purchaseDate: parsed.date,
+          ledgerId: entry.id,
+          version: { increment: 1 },
+        },
+      });
+    await syncDiscount(tx, ownerId, updatedEntry);
+  }
+  const updated = await tx.shoppingItem.update({
+    where: { id: item.id },
+    data: {
+      categoryId,
+      purchaseAmount: parsed.amount,
+      purchasedAt: parsed.date,
+      purchaseAccountId: accountId,
+      purchaseDiscount: discountValue,
+      purchaseDiscountDetails: discountDetails,
+      purchaseRevision: { increment: 1 },
+      purchaseNeedsReview: false,
+      version: { increment: 1 },
+    },
+  });
+  if (item.status === "purchased")
+    await syncShoppingSaving(
+      tx,
+      ownerId,
+      item,
+      parsed.amount,
+      discountValue,
+      parsed.date,
+    );
+  await invalidateList(tx, ownerId, item.listId);
+  return updated;
+}
+
+export async function purchaseRelink(tx: Tx, ownerId: string, body: any) {
+  const item = await owned(tx, "shoppingItem", id.parse(body.id), ownerId);
+  checkVersion(item, body.version);
+  if (item.status !== "purchased")
+    throw new Error("只有已购未记账的物品可以补记账");
+  if (item.ledgerId) throw new Error("这件物品已有有效账单");
+  const parsed = purchaseRelinkSchema.parse(body);
+  const categoryId = await expenseCategory(
+    tx,
+    ownerId,
+    parsed.categoryId === undefined ? item.categoryId : parsed.categoryId,
+    item.categoryId,
+  );
+  const accountId = await expenseAccount(tx, ownerId, parsed.accountId, true);
+  const entry = await saveEntity(tx, ownerId, "ledger", {
+    type: "expense",
+    title: item.name,
+    amount: parsed.amount,
+    date: parsed.date,
+    categoryId,
+    accountId,
+    discount: parsed.discount,
+    discountDetails: parsed.discountDetails,
+    grossAmount: parsed.amount + parsed.discount,
+    autoSaving: true,
+    note: item.note,
+  });
+  const asset = await linkOwnedItem(
+    tx,
+    ownerId,
+    item,
+    entry,
+    parsed.createItem,
+  );
+  const planned = parsed.planned ?? item.budget;
+  if (parsed.createSaving && planned != null) {
+    const split = savingSplit(planned, parsed.amount, parsed.discount);
+    await upsertShoppingSaving(tx, ownerId, item, {
+      type: "downgrade",
+      date: parsed.date,
+      planned,
+      actual: parsed.amount + parsed.discount,
+      amount: split.downgrade,
+    });
+  }
+  const updated = await tx.shoppingItem.update({
+    where: { id: item.id },
+    data: {
+      ledgerId: entry.id,
+      ownedItemId: asset?.id ?? item.ownedItemId,
+      categoryId,
+      purchaseAmount: parsed.amount,
+      purchasedAt: parsed.date,
+      purchaseAccountId: accountId,
+      purchaseDiscount: parsed.discount,
+      purchaseDiscountDetails: parsed.discountDetails,
+      purchaseRevision: { increment: 1 },
+      purchaseNeedsReview: false,
+      version: { increment: 1 },
+    },
+  });
+  await attachShoppingSource(tx, ownerId, item, entry.id);
+  return { item: updated, entry, asset };
+}
+
+export async function purchaseUndo(tx: Tx, ownerId: string, body: any) {
+  const item = await owned(tx, "shoppingItem", id.parse(body.id), ownerId);
+  checkVersion(item, body.version);
+  await invalidateList(tx, ownerId, item.listId);
+  if (item.status !== "purchased")
+    throw new Error("只有已购买的物品可以撤销购买");
+  const keepItem = z.boolean().default(true).parse(body.keepItem);
+  if (!keepItem && item.ownedItemId) {
+    const usage = await tx.usageLog.aggregate({
+      where: { ownerId, itemId: item.ownedItemId },
+      _sum: { count: true },
+    });
+    if ((usage._sum.count || 0) > 0)
+      throw new Error("这件物品已有使用记录，不能删除物品档案");
+  }
+  if (item.ledgerId) {
+    const entry = await owned(tx, "ledgerEntry", item.ledgerId, ownerId);
+    await deleteEntity(tx, ownerId, "ledger", entry);
+  }
+  await tx.savingEntry.deleteMany({
+    where: { ownerId, shoppingItemId: item.id, source: "shopping" },
+  });
+  if (!keepItem && item.ownedItemId)
+    await deleteEntity(
+      tx,
+      ownerId,
+      "items",
+      await owned(tx, "ownedItem", item.ownedItemId, ownerId),
+    );
+  return tx.shoppingItem.update({
+    where: { id: item.id },
+    data: {
+      status: "planned",
+      ledgerId: null,
+      ownedItemId: keepItem ? item.ownedItemId : null,
+      purchaseAmount: null,
+      purchasedAt: null,
+      purchaseAccountId: null,
+      purchaseDiscount: null,
+      purchaseDiscountDetails: "",
+      purchaseRevision: { increment: 1 },
+      purchaseNeedsReview: false,
+      version: { increment: 1 },
+    },
+  });
+}
+
+export async function purchaseRestore(tx: Tx, ownerId: string, body: any) {
+  const item = await owned(tx, "shoppingItem", id.parse(body.id), ownerId);
+  checkVersion(item, body.version);
+  await invalidateList(tx, ownerId, item.listId);
+  if (item.status !== "skipped")
+    throw new Error("只有已放弃的物品可以恢复待购");
+  await tx.savingEntry.deleteMany({
+    where: { ownerId, shoppingItemId: item.id, source: "shopping" },
+  });
+  return tx.shoppingItem.update({
+    where: { id: item.id },
+    data: {
+      status: "planned",
+      purchaseAmount: null,
+      purchasedAt: null,
+      purchaseAccountId: null,
+      purchaseDiscount: null,
+      purchaseDiscountDetails: "",
+      purchaseRevision: { increment: 1 },
+      purchaseNeedsReview: false,
       version: { increment: 1 },
     },
   });
@@ -542,6 +1187,40 @@ export async function convertShopping(tx: Tx, ownerId: string, body: any) {
 
 export async function mutate(user: User, body: any) {
   const ownerId = user.id;
+  if (body.action === "listSettlementPreview")
+    return settlementPreview(db as unknown as Tx, ownerId, id.parse(body.id));
+  if (body.action === "listCheckoutPreview")
+    return checkoutPreview(db as unknown as Tx, ownerId, body);
+  if (
+    [
+      "groupSave",
+      "groupAssign",
+      "groupDissolve",
+      "listCheckout",
+      "listReopen",
+      "listSettlementConfirm",
+      "listSavingMode",
+    ].includes(body.action)
+  )
+    return operation(ownerId, body.operationId, body.action, (tx) =>
+      groupAction(tx, ownerId, body),
+    );
+  if (body.action === "viewPreference") {
+    const entity = z.enum(["ledger", "savings"]).parse(body.entity);
+    const mode = z.enum(["flat", "grouped"]).parse(body.mode);
+    return db.$transaction(async (tx) => {
+      const current = await tx.user.findUniqueOrThrow({
+        where: { id: ownerId },
+      });
+      const preferences = JSON.parse(current.preferences);
+      preferences[`${entity}View`] = mode;
+      await tx.user.update({
+        where: { id: ownerId },
+        data: { preferences: JSON.stringify(preferences) },
+      });
+      return {};
+    });
+  }
   if (body.action === "preferences") {
     const preferences = z
       .object({
@@ -556,7 +1235,15 @@ export async function mutate(user: User, body: any) {
       throw new Error("组件不能重复");
     await db.user.update({
       where: { id: ownerId },
-      data: { preferences: JSON.stringify(preferences) },
+      data: {
+        preferences: JSON.stringify({
+          ...JSON.parse(
+            (await db.user.findUniqueOrThrow({ where: { id: ownerId } }))
+              .preferences,
+          ),
+          ...preferences,
+        }),
+      },
     });
     return {};
   }
@@ -565,9 +1252,28 @@ export async function mutate(user: User, body: any) {
       .object({
         autoBatch: z.boolean(),
         batchSize: z.number().int().min(5).max(10),
+        defaultExpenseAccountId: id.nullish().optional(),
       })
       .parse(body);
-    await db.user.update({ where: { id: ownerId }, data: settings });
+    const { defaultExpenseAccountId, ...preferences } = settings;
+    if (defaultExpenseAccountId) {
+      const account = await owned(
+        db,
+        "account",
+        defaultExpenseAccountId,
+        ownerId,
+      );
+      if (account.archived) throw new Error("归档账户不能设为默认支出账户");
+    }
+    await db.user.update({
+      where: { id: ownerId },
+      data: {
+        ...preferences,
+        ...(defaultExpenseAccountId !== undefined
+          ? { defaultExpenseAccountId: defaultExpenseAccountId || null }
+          : {}),
+      },
+    });
     return {};
   }
   if (body.action === "resolveDiscount")
@@ -724,11 +1430,28 @@ export async function mutate(user: User, body: any) {
         JSON.parse(draft.appliedIndexes).length
       )
         throw new Error("处理中或已部分确认的原始记录不能修改，请另建补充草稿");
-      const content = text.min(1).parse(body.text);
+      const content =
+        body.text === undefined ? draft.text : text.min(1).parse(body.text);
+      const target =
+        body.target === undefined
+          ? draft.target
+          : z
+              .enum(["auto", "ledger", "shopping", "items", "savings", "text"])
+              .parse(body.target);
+      let targetListId: string | null = null;
+      if (target === "shopping") {
+        const listId = body.targetListId ?? draft.targetListId;
+        if (!listId) throw new Error("请选择目标购物清单");
+        const list = await owned(tx, "shoppingList", listId, ownerId);
+        if (list.archived) throw new Error("目标清单已归档，请选择可用清单");
+        targetListId = list.id;
+      }
       return tx.captureDraft.update({
         where: { id: draft.id },
         data: {
           text: content,
+          target,
+          targetListId,
           state: "pending",
           result: "[]",
           error: null,
@@ -736,6 +1459,57 @@ export async function mutate(user: User, body: any) {
         },
       });
     });
+  if (body.action === "draftManual")
+    return operation(ownerId, body.operationId, "draftManual", async (tx) => {
+      const draft = await owned(tx, "captureDraft", id.parse(body.id), ownerId);
+      checkVersion(draft, body.version);
+      if (draft.state === "processing")
+        throw new Error("整理中的草稿请稍后操作");
+      if (JSON.parse(draft.appliedIndexes).length)
+        throw new Error("已部分确认的草稿不能重写，请新建补充草稿");
+      const target = z
+        .enum(["ledger", "shopping", "items", "savings"])
+        .parse(body.target);
+      const data = z.record(z.string(), z.unknown()).parse(body.data ?? {});
+      let targetListId: string | null = null;
+      if (target === "shopping") {
+        const listId = body.targetListId ?? draft.targetListId;
+        if (!listId) throw new Error("请选择目标购物清单");
+        const list = await owned(tx, "shoppingList", listId, ownerId);
+        if (list.archived) throw new Error("目标清单已归档，请选择可用清单");
+        targetListId = list.id;
+        data.listId = list.id;
+      }
+      return tx.captureDraft.update({
+        where: { id: draft.id },
+        data: {
+          target,
+          targetListId,
+          state: "ready",
+          result: JSON.stringify([{ target, data, warnings: [] }]),
+          warnings: "[]",
+          error: null,
+          processedAt: new Date(),
+          version: { increment: 1 },
+        },
+      });
+    });
+  if (body.action === "purchaseEdit")
+    return operation(ownerId, body.operationId, "purchaseEdit", (tx) =>
+      purchaseEdit(tx, ownerId, body),
+    );
+  if (body.action === "purchaseRelink")
+    return operation(ownerId, body.operationId, "purchaseRelink", (tx) =>
+      purchaseRelink(tx, ownerId, body),
+    );
+  if (body.action === "purchaseUndo")
+    return operation(ownerId, body.operationId, "purchaseUndo", (tx) =>
+      purchaseUndo(tx, ownerId, body),
+    );
+  if (body.action === "purchaseRestore")
+    return operation(ownerId, body.operationId, "purchaseRestore", (tx) =>
+      purchaseRestore(tx, ownerId, body),
+    );
   if (body.action === "convert")
     return operation(ownerId, body.operationId, "convert", (tx) =>
       convertShopping(tx, ownerId, body),
@@ -894,7 +1668,7 @@ export async function snapshot(user: User) {
     db.captureDraft.findMany({ where, orderBy: { capturedAt: "desc" } }),
     db.attachment.findMany({
       where,
-      select: { id: true, draftId: true, name: true, size: true },
+      select: { id: true, draftId: true, name: true, size: true, missing: true },
     }),
     db.reviewRequest.findMany({ where, orderBy: { createdAt: "desc" } }),
     db.categoryRule.findMany({ where }),
@@ -910,6 +1684,7 @@ export async function snapshot(user: User) {
       preferences: JSON.parse(user.preferences),
       autoBatch: user.autoBatch,
       batchSize: user.batchSize,
+      defaultExpenseAccountId: user.defaultExpenseAccountId,
     },
     accounts,
     categories,
@@ -924,10 +1699,8 @@ export async function snapshot(user: User) {
     reviews,
     votes,
     rules,
-    ai: {
-      configured: !!(process.env.AI_API_KEY && process.env.AI_BASE_URL),
-      textModel: process.env.AI_TEXT_MODEL || "",
-      visionModel: process.env.AI_VISION_MODEL || "",
-    },
+    groups: await db.recordGroup.findMany({ where }),
+    settlements: await db.listSettlement.findMany({ where }),
+    ai: await aiUsage(ownerId),
   };
 }

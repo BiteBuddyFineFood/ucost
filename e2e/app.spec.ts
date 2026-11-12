@@ -96,8 +96,9 @@ test("演示账本 PC 与手机布局无横向溢出", async ({ page }) => {
 test("HTTP 权限、草稿原始时间、私有附件、公开评议与导出", async ({
   request,
   browser,
+  baseURL,
 }) => {
-  const origin = "http://localhost:3000";
+  const origin = baseURL!;
   const headers = { Origin: origin };
   const username = `http-${randomUUID().slice(0, 8)}`;
   const account = await request.post("/api/auth/register", {
@@ -166,7 +167,12 @@ test("HTTP 权限、草稿原始时间、私有附件、公开评议与导出", 
         capturedAt: new Date().toISOString(),
       },
     });
-    expect((await added.json()).shouldProcess).toBe(i === 2);
+    const ai = state.ai;
+    expect((await added.json()).shouldProcess).toBe(
+      i === 2 &&
+        ai.configured &&
+        (ai.providerMode === "personal" || ai.remaining > 0),
+    );
   }
   expect((await request.get(`/api/attachment/${attachmentId}`)).ok()).toBe(
     true,

@@ -1,0 +1,2 @@
+﻿"schemaVersion","datasetId","entity","currency","amountUnit","textEncoding","id","date","title","type","source","planned","actual","amount","groupId","groupName","sourceListId","settlementId","ledgerId","shoppingItemId","status","suppressed","supersededBySettlementId","sourceKey","note"
+"2","replace-with-your-stable-dataset-id","savings","CNY","cent","apostrophe-v2","saving-001","2026-11-12","示例手工省钱（请替换）","reduced","manual","10000","8000","2000","","","","","","","valid","false","","","复杂来源关系请用 JSON 恢复。"

@@ -1,0 +1,2 @@
+﻿"schemaVersion","datasetId","entity","currency","amountUnit","textEncoding","id","date","type","title","amount","accountId","accountName","toAccountId","toAccountName","categoryId","categoryName","groupId","groupName","sourceListId","sourceShoppingItemId","refundOfId","discount","grossAmount","discountDetails","autoSaving","orderKey","note"
+"2","replace-with-your-stable-dataset-id","ledger","CNY","cent","apostrophe-v2","ledger-001","2026-11-12","expense","示例支出（请替换）","8000","","","","","","","","","","","","2000","10000","","false","","金额均为整数分；导入 CSV 不自动生成优惠省钱。"

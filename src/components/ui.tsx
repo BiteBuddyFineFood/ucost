@@ -1,7 +1,90 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import { X, LoaderCircle, PencilLine } from "lucide-react";
-import { cents, localDate } from "@/lib/domain";
+import {
+  X,
+  LoaderCircle,
+  PencilLine,
+  Tag,
+  Utensils,
+  Coffee,
+  ShoppingBag,
+  Home,
+  Car,
+  Bus,
+  Fuel,
+  Smartphone,
+  Shirt,
+  HeartPulse,
+  Stethoscope,
+  Dumbbell,
+  Gamepad2,
+  Film,
+  BookOpen,
+  GraduationCap,
+  Plane,
+  PawPrint,
+  Gift,
+  Baby,
+  Briefcase,
+  Landmark,
+  Wifi,
+  Receipt,
+  Wallet,
+  PiggyBank,
+  Sparkles,
+  type LucideIcon,
+} from "lucide-react";
+import { categoryColors, categoryIcons, cents, localDate } from "@/lib/domain";
+
+const categoryIconComponents: Record<string, LucideIcon> = {
+  tag: Tag,
+  utensils: Utensils,
+  coffee: Coffee,
+  "shopping-bag": ShoppingBag,
+  home: Home,
+  car: Car,
+  bus: Bus,
+  fuel: Fuel,
+  phone: Smartphone,
+  shirt: Shirt,
+  "heart-pulse": HeartPulse,
+  stethoscope: Stethoscope,
+  dumbbell: Dumbbell,
+  "gamepad-2": Gamepad2,
+  film: Film,
+  "book-open": BookOpen,
+  "graduation-cap": GraduationCap,
+  plane: Plane,
+  "paw-print": PawPrint,
+  gift: Gift,
+  baby: Baby,
+  briefcase: Briefcase,
+  landmark: Landmark,
+  wifi: Wifi,
+  receipt: Receipt,
+  wallet: Wallet,
+  "piggy-bank": PiggyBank,
+  sparkles: Sparkles,
+};
+
+export function CategoryMark({
+  category,
+  size = 16,
+}: {
+  category?: { iconKey?: string | null; color?: string | null } | null;
+  size?: number;
+}) {
+  const Icon = categoryIconComponents[category?.iconKey || ""] || Tag;
+  return (
+    <span
+      className="category-mark"
+      style={category?.color ? { color: category.color } : undefined}
+      aria-hidden="true"
+    >
+      <Icon size={size} strokeWidth={1.8} />
+    </span>
+  );
+}
 
 export async function api(path: string, body?: unknown) {
   const response = await fetch(
@@ -11,7 +94,10 @@ export async function api(path: string, body?: unknown) {
       : {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: JSON.stringify({
+            operationId: crypto.randomUUID(),
+            ...(body as object),
+          }),
         },
   );
   const data = await response.json();
@@ -188,6 +274,32 @@ export function fieldsFor(entity: string, data: any, state: any): Field[] {
       { key: "discount", label: "真实优惠（元）", type: "money" },
       { key: "planned", label: "原计划金额（元）", type: "money" },
       {
+        key: "categoryId",
+        label: "支出分类",
+        type: "select",
+        options: [
+          { value: "", label: "未分类" },
+          ...(state.categories || [])
+            .filter(
+              (c: any) =>
+                c.type === "expense" &&
+                (!c.archived || c.id === data.categoryId),
+            )
+            .map((c: any) => ({ value: c.id, label: c.name })),
+        ],
+      },
+      {
+        key: "accountId",
+        label: "付款账户",
+        type: "select",
+        options: [
+          { value: "", label: "不指定账户" },
+          ...(state.accounts || [])
+            .filter((a: any) => !a.archived || a.id === data.accountId)
+            .map((a: any) => ({ value: a.id, label: a.name })),
+        ],
+      },
+      {
         key: "createLedger",
         label: "生成实际支出及其优惠省钱",
         type: "checkbox",
@@ -297,6 +409,7 @@ export function fieldsFor(entity: string, data: any, state: any): Field[] {
   if (entity === "lists")
     return [
       { key: "name", label: "清单名称", required: true },
+      { key: "budget", label: "清单总预算（元，可不设置）", type: "money" },
       { key: "description", label: "说明", type: "textarea" },
       { key: "archived", label: "归档清单", type: "checkbox" },
     ];
@@ -313,6 +426,21 @@ export function fieldsFor(entity: string, data: any, state: any): Field[] {
       { key: "name", label: "物品名称", required: true },
       { key: "quantity", label: "数量 / 单位" },
       { key: "budget", label: "预计总预算（元）", type: "money" },
+      {
+        key: "categoryId",
+        label: "支出分类（入账时继承）",
+        type: "select",
+        options: [
+          { value: "", label: "未分类" },
+          ...(state.categories || [])
+            .filter(
+              (c: any) =>
+                c.type === "expense" &&
+                (!c.archived || c.id === data.categoryId),
+            )
+            .map((c: any) => ({ value: c.id, label: c.name })),
+        ],
+      },
       {
         key: "status",
         label: "状态",
@@ -444,10 +572,34 @@ export function fieldsFor(entity: string, data: any, state: any): Field[] {
         { value: "income", label: "收入" },
       ],
     },
+    {
+      key: "iconKey",
+      label: "图标",
+      type: "select",
+      options: Object.entries(categoryIcons).map(([value, label]) => ({
+        value,
+        label,
+      })),
+    },
+    {
+      key: "color",
+      label: "颜色",
+      type: "select",
+      options: Object.entries(categoryColors).map(([value, label]) => ({
+        value,
+        label,
+      })),
+    },
     { key: "archived", label: "归档分类", type: "checkbox" },
   ];
 }
 export function initialData(entity: string, state: any, extra: any = {}) {
+  const defaultAccount = state.accounts?.some(
+    (account: any) =>
+      account.id === state.user?.defaultExpenseAccountId && !account.archived,
+  )
+    ? state.user.defaultExpenseAccountId
+    : null;
   const defaults: Record<string, any> = {
     conversion: {
       mode: "buy",
@@ -457,6 +609,8 @@ export function initialData(entity: string, state: any, extra: any = {}) {
       createLedger: true,
       createItem: false,
       createSaving: false,
+      accountId: defaultAccount,
+      categoryId: null,
     },
     ledger: {
       type: "expense",
@@ -466,11 +620,13 @@ export function initialData(entity: string, state: any, extra: any = {}) {
       discount: 0,
       autoSaving: true,
       note: "",
+      accountId: defaultAccount,
     },
     shopping: {
       name: "",
       listId: state.lists?.find((x: any) => !x.archived)?.id || "",
       status: "considering",
+      categoryId: null,
     },
     lists: { name: "", archived: false },
     items: {
@@ -482,7 +638,7 @@ export function initialData(entity: string, state: any, extra: any = {}) {
     },
     savings: { title: "", type: "skipped", date: localDate(), amount: null },
     accounts: { name: "", opening: 0 },
-    categories: { name: "", type: "expense" },
+    categories: { name: "", type: "expense", iconKey: "tag", color: "" },
   };
   return { ...defaults[entity], ...extra };
 }
@@ -655,7 +811,31 @@ export function Editor({
               key={field.key}
               field={field}
               value={data[field.key]}
-              set={(v) => setData({ ...data, [field.key]: v })}
+              set={(v) => {
+                if (field.key === "type") {
+                  const defaultAccount = state.accounts?.some(
+                    (account: any) =>
+                      account.id === state.user?.defaultExpenseAccountId &&
+                      !account.archived,
+                  )
+                    ? state.user.defaultExpenseAccountId
+                    : null;
+                  setData({
+                    ...data,
+                    type: v,
+                    accountId:
+                      v === "expense" &&
+                      (data.accountId == null ||
+                        data.accountId === state.user?.defaultExpenseAccountId)
+                        ? defaultAccount
+                        : v === "expense"
+                          ? data.accountId
+                          : null,
+                  });
+                  return;
+                }
+                setData({ ...data, [field.key]: v });
+              }}
             />
           ))}
         </div>

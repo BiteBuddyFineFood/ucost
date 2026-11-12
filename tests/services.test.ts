@@ -20,6 +20,11 @@ beforeAll(async () => {
 });
 afterAll(async () => {
   for (const model of [
+    "recordGroup",
+    "listSettlement",
+    "aiTask",
+    "aiDailyUsage",
+    "userAiConfig",
     "reviewVote",
     "reviewRequest",
     "usageLog",
@@ -445,5 +450,325 @@ describe("数据库事务和权限", () => {
     expect(purchased.status).toBe("purchased");
     expect(purchased.ledgerId).toBeTruthy();
     expect(purchased.ownedItemId).toBeTruthy();
+  });
+  it("删除账单保留已购事实和购买快照，补记不会重复入账", async () => {
+    const list: any = await save("lists", { name: "快照测试" });
+    const category: any = await save("categories", {
+      name: `餐饮-${op()}`,
+      type: "expense",
+      iconKey: "coffee",
+      color: "#B7794B",
+    });
+    const item: any = await save("shopping", {
+      listId: list.id,
+      name: "带优惠的咖啡机",
+      budget: 50000,
+      categoryId: category.id,
+    });
+    const converted: any = await mutate(user, {
+      action: "convert",
+      operationId: op(),
+      id: item.id,
+      version: item.version,
+      mode: "buy",
+      date: localDate(),
+      paid: 30000,
+      discount: 2000,
+      planned: 50000,
+      categoryId: category.id,
+      createLedger: true,
+      createItem: true,
+      createSaving: true,
+    });
+    expect(converted.purchaseAmount).toBe(30000);
+    expect(converted.purchaseDiscount).toBe(2000);
+    expect(converted.purchasedAt).toBe(localDate());
+    expect(converted.categoryId).toBe(category.id);
+    const linked = await db.ledgerEntry.findUniqueOrThrow({
+      where: { id: converted.ledgerId },
+    });
+    expect(linked.categoryId).toBe(category.id);
+    await mutate(user, {
+      action: "batch",
+      operationId: op(),
+      entity: "ledger",
+      mode: "delete",
+      records: [{ id: linked.id, version: linked.version }],
+    });
+    const preserved = await db.shoppingItem.findUniqueOrThrow({
+      where: { id: item.id },
+    });
+    expect(preserved.status).toBe("purchased");
+    expect(preserved.ledgerId).toBeNull();
+    expect(preserved.purchaseAmount).toBe(30000);
+    expect(preserved.purchasedAt).toBe(localDate());
+    expect(preserved.purchaseDiscount).toBe(2000);
+    expect(preserved.purchaseNeedsReview).toBe(false);
+
+    const relinkBody = {
+      action: "purchaseRelink",
+      operationId: op(),
+      id: item.id,
+      version: preserved.version,
+      amount: 31000,
+      date: localDate(),
+      categoryId: category.id,
+      discount: 0,
+      planned: 50000,
+      createItem: false,
+      createSaving: true,
+    };
+    const relinked: any = await mutate(user, relinkBody);
+    await mutate(user, relinkBody);
+    expect(
+      await db.ledgerEntry.count({
+        where: { ownerId: user.id, id: relinked.entry.id },
+      }),
+    ).toBe(1);
+    const repaired = await db.shoppingItem.findUniqueOrThrow({
+      where: { id: item.id },
+    });
+    expect(repaired.ledgerId).toBe(relinked.entry.id);
+    expect(repaired.purchaseAmount).toBe(31000);
+    expect(repaired.purchaseNeedsReview).toBe(false);
+  });
+  it("修改购买信息同步账单、分类与物品成本，撤销后恢复待购", async () => {
+    const list: any = await save("lists", { name: "购买修正测试" });
+    const firstCategory: any = await save("categories", {
+      name: `餐饮-${op()}`,
+      type: "expense",
+    });
+    const secondCategory: any = await save("categories", {
+      name: `数码-${op()}`,
+      type: "expense",
+    });
+    const item: any = await save("shopping", {
+      listId: list.id,
+      name: "修正测试物品",
+      budget: 40000,
+      categoryId: firstCategory.id,
+    });
+    const converted: any = await mutate(user, {
+      action: "convert",
+      operationId: op(),
+      id: item.id,
+      version: item.version,
+      mode: "buy",
+      date: localDate(),
+      paid: 20000,
+      discount: 0,
+      categoryId: firstCategory.id,
+      createLedger: true,
+      createItem: true,
+      createSaving: false,
+    });
+    const edited: any = await mutate(user, {
+      action: "purchaseEdit",
+      operationId: op(),
+      id: item.id,
+      version: converted.version,
+      amount: 22000,
+      date: localDate(),
+      categoryId: secondCategory.id,
+      discount: 500,
+      syncLedgerCategory: true,
+    });
+    expect(edited.purchaseAmount).toBe(22000);
+    expect(edited.categoryId).toBe(secondCategory.id);
+    const ledger = await db.ledgerEntry.findUniqueOrThrow({
+      where: { id: converted.ledgerId },
+    });
+    expect(ledger.amount).toBe(22000);
+    expect(ledger.categoryId).toBe(secondCategory.id);
+    expect(ledger.discount).toBe(500);
+    expect(
+      (
+        await db.ownedItem.findUniqueOrThrow({
+          where: { id: converted.ownedItemId },
+        })
+      ).price,
+    ).toBe(22000);
+    const undone: any = await mutate(user, {
+      action: "purchaseUndo",
+      operationId: op(),
+      id: item.id,
+      version: edited.version,
+      keepItem: true,
+    });
+    expect(undone.status).toBe("planned");
+    expect(undone.ledgerId).toBeNull();
+    expect(
+      await db.ledgerEntry.count({
+        where: { ownerId: user.id, id: converted.ledgerId },
+      }),
+    ).toBe(0);
+    expect(
+      await db.ownedItem.count({
+        where: { ownerId: user.id, id: converted.ownedItemId },
+      }),
+    ).toBe(1);
+  });
+  it("放弃购买恢复待购时撤销对应省钱记录", async () => {
+    const list: any = await save("lists", { name: "恢复待购测试" });
+    const item: any = await save("shopping", {
+      listId: list.id,
+      name: "放弃后恢复",
+      budget: 9000,
+    });
+    const skipped: any = await mutate(user, {
+      action: "convert",
+      operationId: op(),
+      id: item.id,
+      version: item.version,
+      mode: "skip",
+      date: localDate(),
+      planned: 9000,
+      createSaving: true,
+    });
+    expect(skipped.status).toBe("skipped");
+    expect(
+      await db.savingEntry.count({
+        where: { ownerId: user.id, shoppingItemId: item.id },
+      }),
+    ).toBe(1);
+    const restored: any = await mutate(user, {
+      action: "purchaseRestore",
+      operationId: op(),
+      id: item.id,
+      version: skipped.version,
+    });
+    expect(restored.status).toBe("planned");
+    expect(
+      await db.savingEntry.count({
+        where: { ownerId: user.id, shoppingItemId: item.id },
+      }),
+    ).toBe(0);
+  });
+  it("默认支出账户只用于新支出，显式清空和编辑旧记录不被覆盖", async () => {
+    const account: any = await save("accounts", { name: "默认账户测试" });
+    await mutate(user, {
+      action: "settings",
+      autoBatch: false,
+      batchSize: 5,
+      defaultExpenseAccountId: account.id,
+    });
+    const implicit: any = await save("ledger", {
+      type: "expense",
+      title: "省略账户",
+      amount: 1000,
+      date: localDate(),
+    });
+    expect(implicit.accountId).toBe(account.id);
+    const explicitNone: any = await save("ledger", {
+      type: "expense",
+      title: "显式不指定",
+      amount: 1200,
+      date: localDate(),
+      accountId: null,
+    });
+    expect(explicitNone.accountId).toBeNull();
+    const edited: any = await save(
+      "ledger",
+      { note: "只改备注" },
+      { id: explicitNone.id, version: explicitNone.version },
+    );
+    expect(edited.accountId).toBeNull();
+    await mutate(user, {
+      action: "settings",
+      autoBatch: false,
+      batchSize: 5,
+      defaultExpenseAccountId: null,
+    });
+  });
+  it("分类图标可保存，购物分类会继承到账单并支持同步修改", async () => {
+    const first: any = await save("categories", {
+      name: `图标分类-${op().slice(0, 8)}`,
+      type: "expense",
+      iconKey: "coffee",
+      color: "#B7794B",
+    });
+    const second: any = await save("categories", {
+      name: `图标分类二-${op().slice(0, 8)}`,
+      type: "expense",
+      iconKey: "bus",
+      color: "#5B7C99",
+    });
+    expect(first.iconKey).toBe("coffee");
+    expect(first.color).toBe("#B7794B");
+    const list: any = await save("lists", { name: "分类继承测试" });
+    const item: any = await save("shopping", {
+      listId: list.id,
+      name: "分类继承物品",
+      budget: 3000,
+      categoryId: first.id,
+    });
+    const converted: any = await mutate(user, {
+      action: "convert",
+      operationId: op(),
+      id: item.id,
+      version: item.version,
+      mode: "buy",
+      date: localDate(),
+      paid: 3000,
+      categoryId: first.id,
+      createLedger: true,
+      createSaving: false,
+    });
+    expect(
+      (
+        await db.ledgerEntry.findUniqueOrThrow({
+          where: { id: converted.ledgerId },
+        })
+      ).categoryId,
+    ).toBe(first.id);
+    const changed: any = await save(
+      "shopping",
+      { categoryId: second.id },
+      { id: item.id, version: converted.version },
+    );
+    expect(changed.categoryId).toBe(second.id);
+    expect(
+      (
+        await db.ledgerEntry.findUniqueOrThrow({
+          where: { id: converted.ledgerId },
+        })
+      ).categoryId,
+    ).toBe(second.id);
+  });
+  it("草稿可以修改目标模块与清单，也能生成手动整理候选", async () => {
+    const list: any = await save("lists", { name: "草稿归属测试" });
+    const draft = await db.captureDraft.create({
+      data: {
+        ownerId: user.id,
+        text: "原本记在账本",
+        target: "ledger",
+        capturedAt: new Date(),
+      },
+    });
+    const edited: any = await mutate(user, {
+      action: "draftEdit",
+      operationId: op(),
+      id: draft.id,
+      version: draft.version,
+      target: "shopping",
+      targetListId: list.id,
+    });
+    expect(edited.target).toBe("shopping");
+    expect(edited.targetListId).toBe(list.id);
+    expect(edited.state).toBe("pending");
+    const manual: any = await mutate(user, {
+      action: "draftManual",
+      operationId: op(),
+      id: draft.id,
+      version: edited.version,
+      target: "shopping",
+      targetListId: list.id,
+      data: { name: "手动候选物品", listId: list.id, budget: 1000 },
+    });
+    expect(manual.state).toBe("ready");
+    const candidates = JSON.parse(manual.result);
+    expect(candidates[0].target).toBe("shopping");
+    expect(candidates[0].data.name).toBe("手动候选物品");
+    expect(candidates[0].data.listId).toBe(list.id);
   });
 });

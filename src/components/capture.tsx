@@ -1,4 +1,5 @@
 "use client";
+import { AiStatus } from "./enhancements";
 import { useRef, useState } from "react";
 import { Mic, ImagePlus, Sparkles, Check, Clock3 } from "lucide-react";
 import {
@@ -10,7 +11,7 @@ import {
   initialData,
   Modal,
 } from "./ui";
-import { draftStates } from "@/lib/domain";
+import { draftStates, draftTargetLabels } from "@/lib/domain";
 
 export function Capture({
   state,
@@ -223,6 +224,7 @@ export function Capture({
         <Clock3 size={14} />{" "}
         保存时记录这一条的时间。晚几天整理，“今天”仍按记录当天理解。
       </p>
+      <AiStatus ai={state.ai} />
       {!state.ai.configured && (
         <p className="hint">AI 尚未配置，可以先保存内容。</p>
       )}
@@ -237,7 +239,12 @@ export function Capture({
         </button>
         <button
           className="button"
-          disabled={busy || recording || !state.ai.configured}
+          disabled={
+            busy ||
+            recording ||
+            !state.ai.configured ||
+            (state.ai.providerMode === "system" && !state.ai.remaining)
+          }
           onClick={() => save(true)}
         >
           <Sparkles size={16} />
@@ -258,10 +265,40 @@ export function DraftInbox({
   openBatch,
 }: any) {
   const [busy, setBusy] = useState(false),
-    [review, setReview] = useState<any>(null),
     [error, setError] = useState(""),
-    [editing, setEditing] = useState<any>(null),
-    [editText, setEditText] = useState("");
+    [targetFilter, setTargetFilter] = useState("all"),
+    [listFilter, setListFilter] = useState("all"),
+    [stateFilter, setStateFilter] = useState("active");
+  const activeDrafts = state.drafts.filter((d: any) =>
+    ["pending", "processing", "ready", "failed"].includes(d.state),
+  );
+  const filtered = state.drafts.filter((d: any) => {
+    if (
+      stateFilter === "active" &&
+      !["pending", "processing", "ready", "failed"].includes(d.state)
+    )
+      return false;
+    if (
+      stateFilter !== "active" &&
+      stateFilter !== "all" &&
+      d.state !== stateFilter
+    )
+      return false;
+    if (targetFilter !== "all" && d.target !== targetFilter) return false;
+    if (listFilter !== "all" && d.targetListId !== listFilter) return false;
+    return true;
+  });
+  const partitions = [
+    ["all", "全部"],
+    ["auto", "待判断"],
+    ["ledger", "账本"],
+    ["shopping", "购物清单"],
+    ["items", "物品"],
+    ["savings", "省钱罐"],
+    ["text", "普通备忘"],
+  ];
+  const processable = filtered.filter((d: any) => d.state === "pending");
+  const chosen = filtered.filter((d: any) => selection.includes(d.id));
   async function process(ids: string[], retry = false) {
     setBusy(true);
     setError("");
@@ -290,15 +327,17 @@ export function DraftInbox({
         </div>
         <button
           className="button"
-          disabled={busy}
+          disabled={
+            busy ||
+            (!chosen.length && !processable.length) ||
+            !state.ai.configured ||
+            (state.ai.providerMode === "system" && !state.ai.remaining)
+          }
           onClick={() =>
             process(
-              selection.length
-                ? selection
-                : state.drafts
-                    .filter((d: any) => d.state === "pending")
-                    .slice(0, 10)
-                    .map((d: any) => d.id),
+              chosen.length
+                ? chosen.map((d: any) => d.id)
+                : processable.slice(0, 10).map((d: any) => d.id),
             )
           }
         >
@@ -306,110 +345,77 @@ export function DraftInbox({
         </button>
       </div>
       {error && <p className="error">{error}</p>}
+      <div className="draft-partitions">
+        {partitions.map(([key, label]) => {
+          const count =
+            key === "all"
+              ? activeDrafts.length
+              : activeDrafts.filter((d: any) => d.target === key).length;
+          return (
+            <button
+              key={key}
+              className={targetFilter === key ? "selected" : ""}
+              onClick={() => {
+                setTargetFilter(key);
+                setListFilter("all");
+              }}
+            >
+              {label} <b>{count}</b>
+            </button>
+          );
+        })}
+      </div>
+      <div className="filter-bar draft-filters">
+        <select
+          aria-label="草稿状态筛选"
+          value={stateFilter}
+          onChange={(event) => setStateFilter(event.target.value)}
+        >
+          <option value="active">待处理</option>
+          <option value="all">全部状态</option>
+          <option value="pending">未整理</option>
+          <option value="processing">整理中</option>
+          <option value="ready">待确认</option>
+          <option value="failed">失败</option>
+          <option value="applied">已应用</option>
+          <option value="ignored">已忽略</option>
+        </select>
+        <select
+          aria-label="目标清单筛选"
+          value={listFilter}
+          onChange={(event) => setListFilter(event.target.value)}
+        >
+          <option value="all">全部清单</option>
+          {state.lists.map((list: any) => (
+            <option key={list.id} value={list.id}>
+              {list.name}
+            </option>
+          ))}
+        </select>
+        <span className="hint">
+          当前筛选 {filtered.length}{" "}
+          条；批量整理只处理当前筛选或明确勾选的范围。
+        </span>
+      </div>
       <div className="record-list">
-        {state.drafts.length ? (
-          state.drafts.map((d: any) => (
-            <article className="draft-card" key={d.id}>
-              <div className="record-leading">
-                <input
-                  aria-label="选择草稿"
-                  type="checkbox"
-                  checked={selection.includes(d.id)}
-                  onChange={() => toggle(d.id)}
-                />
-                <span className={`pill ${d.state === "failed" ? "red" : ""}`}>
-                  {draftStates[d.state]}
-                </span>
-                <small>
-                  {new Date(d.capturedAt).toLocaleString("zh-CN", {
-                    timeZone: d.captureTimezone,
-                  })}{" "}
-                  · {d.captureTimezone}
-                </small>
-              </div>
-              <p className="draft-text">{d.text || "图片记录"}</p>
-              {state.attachments
-                .filter((a: any) => a.draftId === d.id)
-                .map((a: any) => (
-                  <a
-                    className="attachment-link"
-                    key={a.id}
-                    href={`/api/attachment/${a.id}`}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    {a.name}
-                  </a>
-                ))}
-              {d.error && <p className="error">{d.error}</p>}
-              {JSON.parse(d.warnings || "[]").map((w: string) => (
-                <p className="hint" key={w}>
-                  {w}
-                </p>
-              ))}
-              <div className="row-actions">
-                {["pending", "failed", "ready"].includes(d.state) &&
-                  JSON.parse(d.appliedIndexes).length === 0 && (
-                    <button
-                      className="text-button"
-                      onClick={() => {
-                        setEditing(d);
-                        setEditText(d.text);
-                      }}
-                    >
-                      修改原话
-                    </button>
-                  )}
-                {["ready", "pending", "failed"].includes(d.state) && (
-                  <button
-                    className="text-button"
-                    onClick={async () => {
-                      try {
-                        await api("mutate", {
-                          action: "draftIgnore",
-                          operationId: crypto.randomUUID(),
-                          id: d.id,
-                          version: d.version,
-                        });
-                        await refresh();
-                      } catch (e) {
-                        setError((e as Error).message);
-                      }
-                    }}
-                  >
-                    忽略剩余内容
-                  </button>
-                )}
-                {["pending", "failed"].includes(d.state) && (
-                  <button
-                    className="button secondary"
-                    disabled={busy}
-                    onClick={() => process([d.id], true)}
-                  >
-                    {d.state === "failed" ? "重试整理" : "AI 整理"}
-                  </button>
-                )}
-                {d.state === "processing" && (
-                  <button
-                    className="text-button"
-                    disabled={busy}
-                    onClick={() => process([d.id], true)}
-                  >
-                    恢复过期任务
-                  </button>
-                )}
-                {d.state === "ready" && (
-                  <button className="button" onClick={() => setReview(d)}>
-                    检查并确认
-                  </button>
-                )}
-              </div>
-            </article>
+        {filtered.length ? (
+          filtered.map((d: any) => (
+            <DraftCard
+              key={d.id}
+              draft={d}
+              state={state}
+              refresh={refresh}
+              notify={notify}
+              selectable
+              selected={selection.includes(d.id)}
+              toggle={toggle}
+              showTarget
+            />
           ))
         ) : (
           <Empty
-            title="待整理的口袋是空的"
-            text="忙的时候，先存一句话或一张截图。"
+            title="当前筛选下没有草稿"
+            text="可以切换分区，或先存一句话、一张截图。"
             action={
               <button className="button" onClick={openCapture}>
                 记一条
@@ -423,41 +429,420 @@ export function DraftInbox({
           批量管理所选草稿
         </button>
       )}
+    </>
+  );
+}
+
+function draftPosition(draft: any, state: any) {
+  const label = draftTargetLabels[draft.target] || draft.target;
+  if (draft.target === "shopping") {
+    const list = state.lists.find(
+      (item: any) => item.id === draft.targetListId,
+    );
+    return `${label} / ${list?.name || (draft.targetListId ? "清单已失效" : "未指定清单")}`;
+  }
+  if (draft.target === "auto") {
+    const targets = [
+      ...new Set(
+        (JSON.parse(draft.result || "[]") as any[])
+          .map((candidate) => candidate.target)
+          .filter((target) => target && target !== "auto"),
+      ),
+    ] as string[];
+    if (targets.length)
+      return `${label} · ${targets
+        .map((target) => draftTargetLabels[target] || target)
+        .join(" / ")}`;
+  }
+  return label;
+}
+
+function DraftCard({
+  draft,
+  state,
+  refresh,
+  notify,
+  selectable = false,
+  selected = false,
+  toggle,
+  showTarget = false,
+}: any) {
+  const applied: number[] = JSON.parse(draft.appliedIndexes || "[]");
+  const [review, setReview] = useState<any>(null),
+    [editing, setEditing] = useState(false),
+    [editText, setEditText] = useState(draft.text),
+    [editTarget, setEditTarget] = useState(draft.target),
+    [editListId, setEditListId] = useState(draft.targetListId || ""),
+    [manual, setManual] = useState(false),
+    [manualTarget, setManualTarget] = useState(
+      ["ledger", "shopping", "items", "savings"].includes(draft.target)
+        ? draft.target
+        : "ledger",
+    ),
+    [manualListId, setManualListId] = useState(
+      draft.targetListId ||
+        state.lists.find((list: any) => !list.archived)?.id ||
+        "",
+    ),
+    [manualData, setManualData] = useState<any>(() =>
+      initialData(
+        ["ledger", "shopping", "items", "savings"].includes(draft.target)
+          ? draft.target
+          : "ledger",
+        state,
+      ),
+    ),
+    [busy, setBusy] = useState(false),
+    [error, setError] = useState("");
+  const list = state.lists.find((item: any) => item.id === draft.targetListId);
+  const missingList = draft.target === "shopping" && !draft.targetListId;
+  const invalidList =
+    draft.target === "shopping" &&
+    !!draft.targetListId &&
+    (!list || list.archived) &&
+    ["pending", "failed", "ready"].includes(draft.state);
+  const canEdit =
+    ["pending", "failed", "ready"].includes(draft.state) && !applied.length;
+  async function processDraft() {
+    setBusy(true);
+    setError("");
+    try {
+      await api("process", { ids: [draft.id], retry: true });
+      await refresh();
+      notify("整理已结束，请检查结果");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function ignore() {
+    setBusy(true);
+    setError("");
+    try {
+      await api("mutate", {
+        action: "draftIgnore",
+        operationId: crypto.randomUUID(),
+        id: draft.id,
+        version: draft.version,
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <>
+      <article className="draft-card">
+        <div className="record-leading">
+          {selectable && (
+            <input
+              aria-label="选择草稿"
+              type="checkbox"
+              checked={selected}
+              onChange={() => toggle(draft.id)}
+            />
+          )}
+          <span className={`pill ${draft.state === "failed" ? "red" : ""}`}>
+            {draftStates[draft.state]}
+          </span>
+          <small>
+            {new Date(draft.capturedAt).toLocaleString("zh-CN", {
+              timeZone: draft.captureTimezone,
+            })}{" "}
+            · {draft.captureTimezone}
+          </small>
+        </div>
+        <div className="draft-target-line">
+          <b>
+            {showTarget
+              ? draftPosition(draft, state)
+              : draftTargetLabels[draft.target]}
+          </b>
+          {(missingList || invalidList) && (
+            <span className="pill yellow">
+              {missingList
+                ? "未指定目标清单，请先选择"
+                : "目标清单已归档或删除，请重新选择"}
+            </span>
+          )}
+        </div>
+        <p className="draft-text">{draft.text || "图片记录"}</p>
+        {state.attachments
+          .filter((attachment: any) => attachment.draftId === draft.id)
+          .map((attachment: any) => (
+            <a
+              className="attachment-link"
+              key={attachment.id}
+              href={attachment.missing ? undefined : `/api/attachment/${attachment.id}`}
+              target="_blank"
+              rel="noreferrer"
+            >
+              {attachment.name}{attachment.missing ? " · 附件未迁移" : ""}
+            </a>
+          ))}
+        {draft.error && <p className="error">{draft.error}</p>}
+        {JSON.parse(draft.warnings || "[]").map((warning: string) => (
+          <p className="hint" key={warning}>
+            {warning}
+          </p>
+        ))}
+        {error && <p className="error">{error}</p>}
+        <div className="row-actions">
+          {canEdit && (
+            <button
+              className="text-button"
+              onClick={() => {
+                setEditing(true);
+                setEditText(draft.text);
+                setEditTarget(draft.target);
+                setEditListId(draft.targetListId || "");
+              }}
+            >
+              修改原话 / 归属
+            </button>
+          )}
+          {["pending", "failed"].includes(draft.state) && (
+            <button
+              className="text-button"
+              onClick={() => {
+                const target = [
+                  "ledger",
+                  "shopping",
+                  "items",
+                  "savings",
+                ].includes(draft.target)
+                  ? draft.target
+                  : "ledger";
+                setManualTarget(target);
+                setManualData(initialData(target, state));
+                setManualListId(
+                  draft.targetListId ||
+                    state.lists.find((item: any) => !item.archived)?.id ||
+                    "",
+                );
+                setManual(true);
+              }}
+            >
+              手动整理
+            </button>
+          )}
+          {["ready", "pending", "failed"].includes(draft.state) && (
+            <button className="text-button" disabled={busy} onClick={ignore}>
+              忽略剩余内容
+            </button>
+          )}
+          {["pending", "failed"].includes(draft.state) && (
+            <button
+              className="button secondary"
+              disabled={busy}
+              onClick={processDraft}
+            >
+              {draft.state === "failed" ? "重试整理" : "AI 整理"}
+            </button>
+          )}
+          {draft.state === "processing" && (
+            <button
+              className="text-button"
+              disabled={busy}
+              onClick={processDraft}
+            >
+              恢复过期任务
+            </button>
+          )}
+          {draft.state === "ready" && (
+            <button className="button" onClick={() => setReview(draft)}>
+              检查并确认
+            </button>
+          )}
+        </div>
+      </article>
       {editing && (
-        <Modal title="修改原始内容" close={() => setEditing(null)}>
-          <p className="hint">保留原采集时间；修改后需要重新整理。</p>
+        <Modal title="修改原始内容与归属" close={() => setEditing(false)}>
+          <p className="hint">
+            保留原采集时间；修改后清除旧候选和旧错误，需要重新整理或手动整理。
+          </p>
           <textarea
             className="capture-text"
             rows={5}
             value={editText}
-            onChange={(e) => setEditText(e.target.value)}
+            onChange={(event) => setEditText(event.target.value)}
           />
+          <div className="form-grid">
+            <label className="field">
+              <span>目标模块</span>
+              <select
+                value={editTarget}
+                onChange={(event) => setEditTarget(event.target.value)}
+              >
+                <option value="auto">自动判断</option>
+                <option value="ledger">账本</option>
+                <option value="shopping">购物清单</option>
+                <option value="items">物品档案</option>
+                <option value="savings">省钱罐</option>
+                <option value="text">普通备忘</option>
+              </select>
+            </label>
+            {editTarget === "shopping" && (
+              <label className="field">
+                <span>目标清单</span>
+                <select
+                  value={editListId}
+                  onChange={(event) => setEditListId(event.target.value)}
+                >
+                  <option value="">请选择</option>
+                  {state.lists
+                    .filter((item: any) => !item.archived)
+                    .map((item: any) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name}
+                      </option>
+                    ))}
+                </select>
+              </label>
+            )}
+          </div>
           <footer>
             <button
               className="button secondary"
-              onClick={() => setEditing(null)}
+              onClick={() => setEditing(false)}
             >
               取消
             </button>
             <button
               className="button"
+              disabled={busy || !editText.trim()}
               onClick={async () => {
+                setBusy(true);
+                setError("");
                 try {
                   await api("mutate", {
                     action: "draftEdit",
                     operationId: crypto.randomUUID(),
-                    id: editing.id,
-                    version: editing.version,
+                    id: draft.id,
+                    version: draft.version,
                     text: editText,
+                    target: editTarget,
+                    targetListId:
+                      editTarget === "shopping" ? editListId || null : null,
                   });
                   await refresh();
-                  setEditing(null);
+                  setEditing(false);
                 } catch (e) {
                   setError((e as Error).message);
+                } finally {
+                  setBusy(false);
                 }
               }}
             >
-              保存原话
+              {busy ? <Busy /> : "保存原话"}
+            </button>
+          </footer>
+        </Modal>
+      )}
+      {manual && (
+        <Modal title="手动整理这条记录" wide close={() => setManual(false)}>
+          <p className="hint">
+            AI
+            不可用或识别失败时，也可以人工填写候选。确认后仍走同一套版本校验和关联流程。
+          </p>
+          <div className="form-grid">
+            <label className="field">
+              <span>目标模块</span>
+              <select
+                value={manualTarget}
+                onChange={(event) => {
+                  const target = event.target.value;
+                  setManualTarget(target);
+                  const next = initialData(target, state);
+                  if (target === "shopping")
+                    next.listId =
+                      manualListId ||
+                      state.lists.find((item: any) => !item.archived)?.id ||
+                      "";
+                  setManualData(next);
+                }}
+              >
+                <option value="ledger">账本</option>
+                <option value="shopping">购物清单</option>
+                <option value="items">物品档案</option>
+                <option value="savings">省钱罐</option>
+              </select>
+            </label>
+            {manualTarget === "shopping" && (
+              <label className="field">
+                <span>目标清单</span>
+                <select
+                  value={manualListId}
+                  onChange={(event) => {
+                    setManualListId(event.target.value);
+                    setManualData({
+                      ...manualData,
+                      listId: event.target.value,
+                    });
+                  }}
+                >
+                  {state.lists
+                    .filter((item: any) => !item.archived)
+                    .map((item: any) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name}
+                      </option>
+                    ))}
+                </select>
+              </label>
+            )}
+          </div>
+          <div className="form-grid">
+            {fieldsFor(manualTarget, manualData, state).map((field: any) => (
+              <FieldInput
+                key={field.key}
+                field={field}
+                value={manualData[field.key]}
+                set={(value: any) =>
+                  setManualData({ ...manualData, [field.key]: value })
+                }
+              />
+            ))}
+          </div>
+          {error && <p className="error">{error}</p>}
+          <footer>
+            <button
+              className="button secondary"
+              onClick={() => setManual(false)}
+            >
+              取消
+            </button>
+            <button
+              className="button"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                setError("");
+                try {
+                  await api("mutate", {
+                    action: "draftManual",
+                    operationId: crypto.randomUUID(),
+                    id: draft.id,
+                    version: draft.version,
+                    target: manualTarget,
+                    targetListId:
+                      manualTarget === "shopping" ? manualListId || null : null,
+                    data: manualData,
+                  });
+                  await refresh();
+                  setManual(false);
+                  notify("手动整理结果已生成，请检查并确认");
+                } catch (e) {
+                  setError((e as Error).message);
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              {busy ? <Busy /> : "生成候选"}
             </button>
           </footer>
         </Modal>
@@ -472,6 +857,49 @@ export function DraftInbox({
         />
       )}
     </>
+  );
+}
+
+export function DraftSection({
+  state,
+  refresh,
+  notify,
+  target,
+  listId = null,
+}: any) {
+  const [open, setOpen] = useState(true);
+  const drafts = state.drafts.filter(
+    (draft: any) =>
+      draft.target === target &&
+      (target !== "shopping" || !listId || draft.targetListId === listId) &&
+      ["pending", "processing", "ready", "failed"].includes(draft.state),
+  );
+  if (!drafts.length) return null;
+  const ready = drafts.filter((draft: any) => draft.state === "ready").length;
+  return (
+    <details
+      className="draft-section"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <Clock3 size={15} />
+        本页暂存 <b>{drafts.length}</b> 条
+        {ready > 0 && <span className="pill">{ready} 条待确认</span>}
+      </summary>
+      <div className="draft-section-list">
+        {drafts.map((draft: any) => (
+          <DraftCard
+            key={draft.id}
+            draft={draft}
+            state={state}
+            refresh={refresh}
+            notify={notify}
+            showTarget={target === "shopping" && !listId}
+          />
+        ))}
+      </div>
+    </details>
   );
 }
 

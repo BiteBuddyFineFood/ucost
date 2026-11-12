@@ -27,6 +27,7 @@ import {
   money,
   savingTypes,
   heldDays,
+  effectiveSaving,
 } from "@/lib/domain";
 import { Modal, Empty, Jar, api, Busy } from "./ui";
 
@@ -103,7 +104,7 @@ export default function Dashboard({
   });
   const savings = state.savings.filter(
     (x: any) =>
-      x.status === "valid" && x.date >= dates.start && x.date <= dates.end,
+      effectiveSaving(x) && x.date >= dates.start && x.date <= dates.end,
   );
   const colors = [
     "#356C5A",

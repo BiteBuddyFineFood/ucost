@@ -96,7 +96,7 @@ function graph(data: any, identity: any[] = []) {
 async function main() {
   try {
     if (mode === "export") {
-      const u = await db.user.findUniqueOrThrow({
+      const u = await db.user.require({
         where: { id: "legacy-user" },
       });
       const { mutate } = await import("../src/server/services");
@@ -142,7 +142,7 @@ async function main() {
         fingerprint: settlement.fingerprint,
         confirmedClosed: true,
       });
-      const partial = await db.captureDraft.create({
+      const partial = await db.captureDraft.insert({
         data: {
           ownerId: u.id,
           text: "部分确认原话",
@@ -173,7 +173,7 @@ async function main() {
           appliedIndexes: "[0]",
         },
       });
-      await db.ledgerEntry.update({
+      await db.ledgerEntry.change({
         where: { id: "expense" },
         data: { sourceDraftId: partial.id },
       });
@@ -188,7 +188,7 @@ async function main() {
       );
       console.log("Migrated fixture exported with source relationships.");
     } else if (mode === "import") {
-      const u = await db.user.create({
+      const u = await db.user.insert({
         data: {
           id: "destination-user",
           username: "migration-destination",
@@ -215,11 +215,11 @@ async function main() {
         "Imported into a separate new database; repeated import skipped.",
       );
     } else if (mode === "verify-restart") {
-      const u = await db.user.findUniqueOrThrow({
+      const u = await db.user.require({
         where: { id: "destination-user" },
       });
       const data = await exportData(u);
-      const identity = await db.importIdentity.findMany({
+      const identity = await db.importIdentity.list({
         where: { ownerId: u.id },
       });
       const expected = JSON.parse(
@@ -280,7 +280,7 @@ async function main() {
       );
     } else throw new Error("Unknown verification phase");
   } finally {
-    await db.$disconnect();
+
   }
 }
 main().catch((e) => {

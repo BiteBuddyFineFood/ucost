@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ucost-e2e",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-10-13",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": { "directory": ".open-next/assets", "binding": "ASSETS" },
+  "services": [
+    { "binding": "WORKER_SELF_REFERENCE", "service": "ucost-e2e" },
+    { "binding": "AI_TRANSPORT", "service": "ucost-ai-stub" }
+  ],
+  "d1_databases": [{ "binding": "DB", "database_name": "ucost-e2e", "database_id": "00000000-0000-0000-0000-000000000002", "migrations_dir": "d1/migrations" }],
+  "vars": {
+    "APP_URL": "http://localhost:8788",
+    "AI_ALLOWED_ORIGINS": "https://fixture.invalid",
+    "AI_BASE_URL": "https://fixture.invalid/v1",
+    "AI_API_KEY": "deterministic-local-fixture",
+    "AI_TEXT_MODEL": "fixture", "AI_VISION_MODEL": "fixture",
+    "AI_REQUIRE_INVITE": "false"
+  }
+}

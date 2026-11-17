@@ -126,7 +126,7 @@ export default function ReviewPage({ token }: { token: string }) {
               <button
                 type="button"
                 className="text-button"
-                disabled={busy || !comment}
+                disabled={busy || !comment || !user?.aiAllowed}
                 onClick={async () => {
                   setBusy(true);
                   try {

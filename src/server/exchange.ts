@@ -1,7 +1,9 @@
-import { Prisma, User } from "@prisma/client";
+import type { User } from "./schema";
+import type { Store } from "./store";
+import fields from "./fields.json";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { db, writeTransaction } from "./db";
+import { writeBatch } from "./db";
 import { effectiveSaving, totals } from "@/lib/domain";
 import {
   canonical,
@@ -17,7 +19,7 @@ import {
   type Records,
 } from "./exchange-codec";
 
-type Tx = Prisma.TransactionClient;
+type Tx = Store;
 type FileData = ReturnType<typeof decodeFile>;
 const key = (entity: string, id: string) => `${entity}:${id}`;
 const targetSchema = z.object({
@@ -47,8 +49,8 @@ function publicRow(entity: Entity, row: any) {
 }
 
 export async function exportData(user: User) {
-  return db.$transaction(async (tx) => {
-    const dataset = await tx.exchangeDataset.upsert({
+  return writeBatch(async (tx) => {
+    const dataset = await tx.exchangeDataset.put({
       where: { ownerId: user.id },
       create: { ownerId: user.id },
       update: {},
@@ -59,7 +61,7 @@ export async function exportData(user: User) {
         entity === "votes"
           ? { reviewId: { in: records.reviews.map((r) => r.id) } }
           : { ownerId: user.id };
-      records[entity] = await (tx as any)[models[entity]].findMany({
+      records[entity] = await (tx as any)[models[entity]].list({
         where,
         orderBy: { id: "asc" },
       });
@@ -422,6 +424,30 @@ function validateGraph(
         error("drafts", draft, "已确认索引找不到相应正式记录");
     }
   }
+  for (const r of records.items) {
+    if (r.boxId && !find("boxes", r.boxId))
+      error("items", r, "收纳箱不存在");
+    if (r.storageEnabled && !r.boxId && !r.location?.trim())
+      error("items", r, "开启收纳但缺少位置");
+    if (r.expiryEnabled && !r.expiresOn)
+      error("items", r, "开启保质期但缺少到期日");
+    if (r.costEnabled && (!r.purchaseDate || r.price == null))
+      error("items", r, "计算成本但缺少购入日期或金额");
+  }
+  for (const rule of records.reminders) {
+    const targetEntity = rule.targetType === "item" ? "items" : "shopping";
+    const target = find(targetEntity, rule.targetId);
+    if (!target)
+      error("reminders", rule, "提醒目标不存在");
+    if (rule.triggerType === "relative" && rule.offsetDays == null)
+      error("reminders", rule, "相对提醒缺少提前天数");
+    if (rule.triggerType === "fixed" && !rule.fixedAt)
+      error("reminders", rule, "固定提醒缺少时间");
+  }
+  for (const occurrence of records.reminderEvents) {
+    if (!find("reminders", occurrence.ruleId))
+      error("reminderEvents", occurrence, "提醒规则不存在");
+  }
 }
 
 async function plan(
@@ -438,13 +464,13 @@ async function plan(
     warnings = [...file.warnings];
   const local = emptyRecords();
   for (const e of entities)
-    local[e] = await (tx as any)[models[e]].findMany({
+    local[e] = await (tx as any)[models[e]].list({
       where:
         e === "votes"
           ? { reviewId: { in: local.reviews.map((r) => r.id) } }
           : { ownerId },
     });
-  const identities = await tx.importIdentity.findMany({
+  const identities = await tx.importIdentity.list({
     where: { ownerId, datasetId: file.datasetId },
   });
   const map: Record<string, string> = {},
@@ -461,7 +487,7 @@ async function plan(
       errors.push(`${key(m.entity, m.sourceId)} 映射目标已归档`);
     else map[key(m.entity, m.sourceId)] = m.localId;
   }
-  const ownDataset = await tx.exchangeDataset.findFirst({
+  const ownDataset = await tx.exchangeDataset.first({
     where: { id: file.datasetId, ownerId },
   });
   let duplicates = 0;
@@ -577,6 +603,18 @@ async function plan(
     const row = { ...original, id: action.localId };
     for (const [field, target] of Object.entries(refs[entity] || {}))
       if (row[field]) row[field] = resolve(target, row[field]);
+    if (entity === "reminders" || entity === "reminderEvents") {
+      row.targetId = resolve(
+        original.targetType === "item" ? "items" : "shopping",
+        original.targetId,
+      );
+    }
+    if (entity === "reminderEvents") {
+      const sourceRule = file.records.reminders.find(
+        (rule) => rule.id === original.ruleId,
+      );
+      row.dedupeKey = `${row.ruleId}:${sourceRule?.version ?? 1}:${row.anchorDate || row.dueAt}`;
+    }
     for (const field of [
       "accountId",
       "toAccountId",
@@ -624,6 +662,13 @@ async function plan(
   const combined = Object.fromEntries(
     entities.map((e) => [e, [...local[e], ...incoming[e]]]),
   ) as Records;
+  for (const draft of incoming.drafts) {
+    if (["pending", "processing", "failed"].includes(draft.state) &&
+        (draft.inputMethod === "image" || incoming.attachments.some(a => a.draftId === draft.id))) {
+      draft.state = "failed";
+      draft.error = "原截图未迁移，请重新选择截图后识别；原本地文件仍保留";
+    }
+  }
   const deleted = new Set(
     file.deletedSources.map((r) =>
       key(r.entity, resolve(r.entity, r.sourceId)),
@@ -729,7 +774,7 @@ export async function previewImport(user: User, input: unknown) {
     })
     .parse(input);
   const file = decodeFile(body.content, body.sourceId);
-  return writeTransaction(
+  return writeBatch(
     async (tx) => {
       const allocations = {};
       const p = await plan(
@@ -740,7 +785,7 @@ export async function previewImport(user: User, input: unknown) {
         body.decisions,
         allocations,
       );
-      const job = await tx.importJob.create({
+      const job = await tx.importJob.insert({
         data: {
           ownerId: user.id,
           fileHash: hash(body.content),
@@ -765,9 +810,9 @@ export async function commitImport(user: User, input: unknown) {
   const { jobId } = z
     .object({ jobId: z.string().min(1).max(200) })
     .parse(input);
-  return writeTransaction(
+  return writeBatch(
     async (tx) => {
-      const job = await tx.importJob.findFirst({
+      const job = await tx.importJob.first({
         where: { id: jobId, ownerId: user.id },
       });
       if (!job) throw new Error("导入任务不存在或无权访问");
@@ -791,26 +836,23 @@ export async function commitImport(user: User, input: unknown) {
         for (const row of p.incoming[entity]) {
           const data = { ...row };
           if (entity !== "votes") data.ownerId = user.id;
-          // Prisma takes Date objects for database DateTime values.
-          const model = Prisma.dmmf.datamodel.models.find(
-            (m) => m.name.toLowerCase() === models[entity].toLowerCase(),
-          )!;
+          const model = fields[models[entity]];
           for (const f of model.fields)
             if (f.type === "DateTime" && data[f.name] != null)
               data[f.name] = new Date(data[f.name]);
-          await (tx as any)[models[entity]].create({ data });
+          await (tx as any)[models[entity]].insert({ data });
         }
       for (const action of p.actions) {
         const row = await (tx as any)[
           models[action.entity as Entity]
-        ].findUnique({ where: { id: action.localId } });
+        ].first({ where: { id: action.localId } });
         const identity = {
           ownerId: user.id,
           datasetId: saved.file.datasetId,
           entity: action.entity,
           sourceId: action.sourceId,
         };
-        await tx.importIdentity.upsert({
+        await tx.importIdentity.put({
           where: { ownerId_datasetId_entity_sourceId: identity },
           create: {
             ...identity,
@@ -831,7 +873,7 @@ export async function commitImport(user: User, input: unknown) {
       for (const mapping of saved.mappings) {
         const row = await (tx as any)[
           models[mapping.entity as Entity]
-        ].findUnique({ where: { id: mapping.localId } });
+        ].first({ where: { id: mapping.localId } });
         const source = saved.file.records[mapping.entity].find(
           (r: any) => r.id === mapping.sourceId,
         );
@@ -841,7 +883,7 @@ export async function commitImport(user: User, input: unknown) {
           entity: mapping.entity,
           sourceId: mapping.sourceId,
         };
-        await tx.importIdentity.upsert({
+        await tx.importIdentity.put({
           where: { ownerId_datasetId_entity_sourceId: identity },
           create: {
             ...identity,
@@ -870,7 +912,7 @@ export async function commitImport(user: User, input: unknown) {
         after: p.summary.after,
         warnings: p.summary.warnings,
       };
-      await tx.importJob.update({
+      await tx.importJob.change({
         where: { id: job.id },
         data: { status: "committed", result: JSON.stringify(result) },
       });

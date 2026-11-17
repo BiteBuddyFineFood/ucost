@@ -1,9 +1,9 @@
-import { Prisma } from "@prisma/client";
+import fields from "./fields.json";
 import { createHash } from "node:crypto";
 import { categoryColors, categoryIcons, validDate } from "@/lib/domain";
 
-export const MAX_FILE_BYTES = 8_000_000;
-export const MAX_RECORDS = 10_000;
+export const MAX_FILE_BYTES = 500_000;
+export const MAX_RECORDS = 300;
 export const models = {
   accounts: "account",
   categories: "category",
@@ -13,6 +13,7 @@ export const models = {
   shopping: "shoppingItem",
   ledger: "ledgerEntry",
   items: "ownedItem",
+  boxes: "storageBox",
   usage: "usageLog",
   settlements: "listSettlement",
   savings: "savingEntry",
@@ -21,6 +22,8 @@ export const models = {
   reviews: "reviewRequest",
   votes: "reviewVote",
   analyses: "aiAnalysis",
+  reminders: "reminderRule",
+  reminderEvents: "reminderOccurrence",
 } as const;
 export type Entity = keyof typeof models;
 export type Records = Record<Entity, any[]>;
@@ -79,7 +82,7 @@ export const refs: Partial<Record<Entity, Record<string, Entity>>> = {
     sourceShoppingItemId: "shopping",
     sourceDraftId: "drafts",
   },
-  items: { ledgerId: "ledger", sourceDraftId: "drafts" },
+  items: { ledgerId: "ledger", boxId: "boxes", sourceDraftId: "drafts" },
   usage: { itemId: "items" },
   savings: {
     ledgerId: "ledger",
@@ -95,14 +98,13 @@ export const refs: Partial<Record<Entity, Record<string, Entity>>> = {
   attachments: { draftId: "drafts" },
   reviews: { itemId: "shopping" },
   votes: { reviewId: "reviews" },
+  reminderEvents: { ruleId: "reminders" },
 };
 const ignored = new Set(["ownerId", "token", "storageKey"]);
 export function normalizeRow(entity: Entity, input: any, warnings: string[]) {
   if (!input || typeof input !== "object" || Array.isArray(input))
     throw new Error(`${entity}: 记录必须是对象`);
-  const model = Prisma.dmmf.datamodel.models.find(
-    (m) => m.name.toLowerCase() === models[entity].toLowerCase(),
-  )!;
+  const model = fields[models[entity]];
   const row: any = {};
   for (const field of model.fields) {
     const k = field.name;
@@ -143,7 +145,14 @@ export function normalizeRow(entity: Entity, input: any, warnings: string[]) {
     }
     row[k] = v;
   }
-  for (const k of ["date", "purchaseDate", "retiredDate", "purchasedAt"])
+  for (const k of [
+    "date",
+    "purchaseDate",
+    "retiredDate",
+    "purchasedAt",
+    "departureDate",
+    "expiresOn",
+  ])
     if (row[k] != null && !validDate(row[k]))
       throw new Error(`${entity}.${k}: 日期无效`);
   const choices: Record<string, string[]> = {
@@ -162,6 +171,17 @@ export function normalizeRow(entity: Entity, input: any, warnings: string[]) {
     "savings.status": ["valid", "pending", "revoked"],
     "settlements.status": ["valid", "pending", "revoked"],
     "items.mode": ["day", "use"],
+    "items.status": ["active", "used", "discarded", "archived"],
+    "lists.kind": ["shopping", "travel", "normal"],
+    "reminders.targetType": ["shopping", "listItem", "item"],
+    "reminders.triggerType": ["fixed", "relative"],
+    "reminderEvents.targetType": ["shopping", "listItem", "item"],
+    "reminderEvents.state": [
+      "pending",
+      "done",
+      "cancelled",
+      "superseded",
+    ],
     "drafts.target": ["auto", "ledger", "shopping", "items", "savings", "text"],
     "drafts.state": [
       "pending",
@@ -189,9 +209,15 @@ export function normalizeRow(entity: Entity, input: any, warnings: string[]) {
   if (["ledger", "savings"].includes(entity) && !row.title.trim())
     throw new Error("记录标题不能为空");
   if (
-    ["accounts", "categories", "lists", "groups", "shopping", "items"].includes(
-      entity,
-    ) &&
+    [
+      "accounts",
+      "categories",
+      "lists",
+      "groups",
+      "shopping",
+      "items",
+      "boxes",
+    ].includes(entity) &&
     !row.name.trim()
   )
     throw new Error(`${entity}: 名称不能为空`);
@@ -366,7 +392,7 @@ export function exportCsv(
 }
 export function decodeFile(text: string, sourceId?: string) {
   if (Buffer.byteLength(text, "utf8") > MAX_FILE_BYTES)
-    throw new Error("单文件最多 8MB，请拆分导入");
+    throw new Error("单文件最多 500KB，请拆分导入");
   text = text.replace(/^\ufeff/, "");
   const records = emptyRecords(),
     warnings: string[] = [];
@@ -513,7 +539,7 @@ export function decodeFile(text: string, sourceId?: string) {
   if (
     Object.values(records).reduce((n, rows) => n + rows.length, 0) > MAX_RECORDS
   )
-    throw new Error("单文件最多 10000 条记录，请拆分导入");
+    throw new Error("单文件最多 300 条记录，请拆分导入");
   for (const e of entities) {
     records[e] = records[e].map((r) => normalizeRow(e, r, warnings));
     if (new Set(records[e].map((r) => r.id)).size !== records[e].length)
@@ -523,7 +549,7 @@ export function decodeFile(text: string, sourceId?: string) {
   if (
     Object.values(records).reduce((n, rows) => n + rows.length, 0) > MAX_RECORDS
   )
-    throw new Error("兼容回填后的记录超过 10000 条，请拆分导入");
+    throw new Error("兼容回填后的记录超过 300 条，请拆分导入");
   return { datasetId, records, warnings, legacy, csv, deletedSources };
 }
 export function upgradeLegacy(records: Records, warnings: string[]) {

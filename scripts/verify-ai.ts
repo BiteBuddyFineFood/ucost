@@ -7,7 +7,7 @@ import { db } from "../src/server/db";
 import { processDraft, applyDraft, analyze } from "../src/server/ai";
 
 async function main() {
-  const user = await db.user.create({
+  const user = await db.user.insert({
     data: {
       username: `ai-test-${randomUUID()}`,
       passwordHash: "isolated-test",
@@ -20,7 +20,7 @@ async function main() {
   };
   async function processWithOneRetry(id: string) {
     await processDraft(user, id);
-    const result = await db.captureDraft.findUniqueOrThrow({ where: { id } });
+    const result = await db.captureDraft.require({ where: { id } });
     if (result.state === "failed") {
       report.checks.push({
         name: "人工重试路径",
@@ -31,7 +31,7 @@ async function main() {
     }
   }
   try {
-    const draft = await db.captureDraft.create({
+    const draft = await db.captureDraft.insert({
       data: {
         ownerId: user.id,
         text: "今天工资到账8000元，午饭28元。",
@@ -40,7 +40,7 @@ async function main() {
       },
     });
     await processWithOneRetry(draft.id);
-    const textResult = await db.captureDraft.findUniqueOrThrow({
+    const textResult = await db.captureDraft.require({
       where: { id: draft.id },
     });
     assert.equal(
@@ -81,7 +81,7 @@ async function main() {
     );
     const image = await page.screenshot({ path: "data/ai-test-receipt.png" });
     await browser.close();
-    const imageDraft = await db.captureDraft.create({
+    const imageDraft = await db.captureDraft.insert({
       data: {
         ownerId: user.id,
         text: "识别这张测试收据，确认是实际优惠。",
@@ -91,7 +91,7 @@ async function main() {
     });
     const storageKey = `ai-test-${randomUUID()}`;
     await writeFile(`uploads/${storageKey}`, image);
-    await db.attachment.create({
+    await db.attachment.insert({
       data: {
         ownerId: user.id,
         draftId: imageDraft.id,
@@ -103,7 +103,7 @@ async function main() {
       },
     });
     await processWithOneRetry(imageDraft.id);
-    const visionResult = await db.captureDraft.findUniqueOrThrow({
+    const visionResult = await db.captureDraft.require({
       where: { id: imageDraft.id },
     });
     assert.equal(
@@ -133,7 +133,7 @@ async function main() {
       1,
     );
     assert.equal(
-      (await db.savingEntry.findFirstOrThrow({ where: { ownerId: user.id } }))
+      (await db.savingEntry.require({ where: { ownerId: user.id } }))
         .amount,
       2000,
     );
@@ -144,10 +144,10 @@ async function main() {
       discount: 2000,
     });
 
-    const list = await db.shoppingList.create({
+    const list = await db.shoppingList.insert({
       data: { ownerId: user.id, name: "测试超市" },
     });
-    const shoppingDraft = await db.captureDraft.create({
+    const shoppingDraft = await db.captureDraft.insert({
       data: {
         ownerId: user.id,
         text: "牛奶两盒，鸡蛋一打，洗衣液别超过五十元，要无香的。",
@@ -157,7 +157,7 @@ async function main() {
       },
     });
     await processWithOneRetry(shoppingDraft.id);
-    const shoppingResult = await db.captureDraft.findUniqueOrThrow({
+    const shoppingResult = await db.captureDraft.require({
       where: { id: shoppingDraft.id },
     });
     assert.equal(
@@ -189,7 +189,7 @@ async function main() {
       passed: true,
       items: 3,
     });
-    const chair = await db.shoppingItem.create({
+    const chair = await db.shoppingItem.insert({
       data: {
         ownerId: user.id,
         listId: list.id,
@@ -197,7 +197,7 @@ async function main() {
         budget: 50000,
       },
     });
-    const conversion = await db.captureDraft.create({
+    const conversion = await db.captureDraft.insert({
       data: {
         ownerId: user.id,
         target: "auto",
@@ -206,7 +206,7 @@ async function main() {
       },
     });
     await processWithOneRetry(conversion.id);
-    const conversionResult = await db.captureDraft.findUniqueOrThrow({
+    const conversionResult = await db.captureDraft.require({
       where: { id: conversion.id },
     });
     assert.equal(
@@ -228,7 +228,7 @@ async function main() {
       ],
     });
     assert.equal(
-      (await db.shoppingItem.findUniqueOrThrow({ where: { id: chair.id } }))
+      (await db.shoppingItem.require({ where: { id: chair.id } }))
         .status,
       "purchased",
     );
@@ -255,8 +255,8 @@ async function main() {
       "aiAnalysis",
     ];
     for (const model of models)
-      await (db as any)[model].deleteMany({ where: { ownerId: user.id } });
-    await db.user.delete({ where: { id: user.id } });
+      await (db as any)[model].removeAll({ where: { ownerId: user.id } });
+    await db.user.remove({ where: { id: user.id } });
     await mkdir("docs", { recursive: true });
     await writeFile(
       "docs/AI_VERIFICATION.json",
@@ -272,4 +272,4 @@ main()
     );
     process.exitCode = 1;
   })
-  .finally(() => db.$disconnect());
+  .finally(() => Promise.resolve());

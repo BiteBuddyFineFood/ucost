@@ -19,6 +19,26 @@ model User {
   createdAt               DateTime @default(now())
 }
 
+model InviteCode {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  maxUses   Int      @default(10)
+  usedCount Int      @default(0)
+  note      String   @default("")
+  disabled  Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
+
+model InviteRedemption {
+  id        String   @id @default(cuid())
+  codeId    String
+  code      String
+  ownerId   String   @unique
+  createdAt DateTime @default(now())
+
+  @@index([codeId])
+}
+
 model Session {
   id        String   @id
   userId    String
@@ -93,6 +113,8 @@ model ShoppingList {
   id          String    @id @default(cuid())
   ownerId     String
   name        String
+  kind        String    @default("shopping")
+  departureDate String?
   description String    @default("")
   archived    Boolean   @default(false)
   sort        Int       @default(0)
@@ -120,6 +142,8 @@ model ShoppingItem {
   note                    String   @default("")
   originalText            String   @default("")
   status                  String   @default("considering")
+  done                    Boolean  @default(false)
+  groupName               String   @default("")
   categoryId              String?
   ledgerId                String?
   ownedItemId             String?
@@ -142,18 +166,81 @@ model OwnedItem {
   id            String   @id @default(cuid())
   ownerId       String
   name          String
-  purchaseDate  String
+  purchaseDate  String?
   retiredDate   String?
-  price         Int
+  price         Int?
   recovery      Int      @default(0)
   ledgerId      String?
   note          String   @default("")
   mode          String   @default("day")
+  quantity      Int      @default(1)
+  unit          String   @default("件")
+  storageEnabled Boolean @default(false)
+  expiryEnabled Boolean  @default(false)
+  costEnabled   Boolean  @default(true)
+  location      String   @default("")
+  boxId         String?
+  expiresOn     String?
+  status        String   @default("active")
+  sourceNote    String   @default("")
+  quantityConfirmedAt DateTime?
   sourceDraftId String?
   version       Int      @default(1)
   createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   @@index([ownerId])
+  @@index([ownerId, boxId])
+  @@index([ownerId, expiresOn])
+}
+
+model StorageBox {
+  id        String   @id @default(cuid())
+  ownerId   String
+  name      String
+  location  String   @default("")
+  note      String   @default("")
+  color     String   @default("")
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId])
+}
+
+model ReminderRule {
+  id          String   @id @default(cuid())
+  ownerId     String
+  targetType  String
+  targetId    String
+  triggerType String
+  fixedAt     DateTime?
+  offsetDays  Int?
+  localTime   String   @default("09:00")
+  timezone    String   @default("Asia/Shanghai")
+  enabled     Boolean  @default(true)
+  version     Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([ownerId, targetType, targetId])
+}
+
+model ReminderOccurrence {
+  id          String    @id @default(cuid())
+  ownerId     String
+  ruleId      String
+  targetType  String
+  targetId    String
+  dedupeKey   String    @unique
+  dueAt       DateTime
+  state       String    @default("pending")
+  handledAt   DateTime?
+  snoozedUntil DateTime?
+  anchorDate  String?
+  createdAt   DateTime  @default(now())
+
+  @@index([ownerId, state, dueAt])
 }
 
 model UsageLog {

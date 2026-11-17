@@ -1,6 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
+import { openDesktopNavItem } from "./navigation-helpers";
 for (const mobile of [false, true]) {
   test(`${mobile ? "手机" : "桌面"}文件导入预检、映射、事务确认与重复导入`, async ({
     page,
@@ -76,11 +77,7 @@ for (const mobile of [false, true]) {
           .locator(".mobile-more")
           .getByRole("button", { name: "设置", exact: true })
           .click();
-      } else
-        await page
-          .locator(".sidebar nav")
-          .getByRole("button", { name: "设置", exact: true })
-          .click();
+      } else await openDesktopNavItem(page, "设置");
     };
     await openSettings();
     const downloadEvent = page.waitForEvent("download");
@@ -164,13 +161,13 @@ for (const mobile of [false, true]) {
       ),
     ).toBe(true);
     expect(errors).toEqual([]);
-    await mkdir("data/p4-verification", { recursive: true });
+    const evidence = process.env.E2E_EVIDENCE_DIR || `data/cloudflare-verification/${randomUUID()}`;
+    await mkdir(evidence, { recursive: true });
     await page.screenshot({
-      path: `data/p4-verification/${mobile ? "mobile" : "desktop"}-import.png`,
       fullPage: true,
     });
     await writeFile(
-      `data/p4-verification/${mobile ? "mobile" : "desktop"}-ui.json`,
+      `${evidence}/${mobile ? "mobile" : "desktop"}-ui.json`,
       JSON.stringify(
         {
           testedAt: new Date().toISOString(),

@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { db } from "../src/server/db";
 import { mutate, vote } from "../src/server/services";
 import { localDate } from "../src/lib/domain";
+import { addDays } from "../src/lib/period";
 import { applyDraft, processDraft, normalizeCandidate } from "../src/server/ai";
 
 let user: any, other: any;
@@ -11,10 +12,10 @@ const op = () => randomUUID();
 const save = (entity: string, data: any, extra = {}) =>
   mutate(user, { action: "save", entity, data, operationId: op(), ...extra });
 beforeAll(async () => {
-  user = await db.user.create({
+  user = await db.user.insert({
     data: { username: `test-${op()}`, passwordHash: "test-only" },
   });
-  other = await db.user.create({
+  other = await db.user.insert({
     data: { username: `test-${op()}`, passwordHash: "test-only" },
   });
 });
@@ -27,8 +28,11 @@ afterAll(async () => {
     "userAiConfig",
     "reviewVote",
     "reviewRequest",
+    "reminderOccurrence",
+    "reminderRule",
     "usageLog",
     "ownedItem",
+    "storageBox",
     "savingEntry",
     "shoppingItem",
     "shoppingList",
@@ -42,16 +46,15 @@ afterAll(async () => {
     "appliedOperation",
   ]) {
     if (model === "reviewVote") {
-      await db.reviewVote.deleteMany({
+      await db.reviewVote.removeAll({
         where: { userId: { in: [user.id, other.id] } },
       });
     } else
-      await (db as any)[model].deleteMany({
+      await (db as any)[model].removeAll({
         where: { ownerId: { in: [user.id, other.id] } },
       });
   }
-  await db.user.deleteMany({ where: { id: { in: [user.id, other.id] } } });
-  await db.$disconnect();
+  await db.user.removeAll({ where: { id: { in: [user.id, other.id] } } });
 });
 describe("数据库事务和权限", () => {
   it("重复操作 ID 不重复生成账单与优惠，退款使优惠待核对/失效", async () => {
@@ -88,8 +91,7 @@ describe("数据库事务和权限", () => {
       date: localDate(),
     });
     expect(
-      (await db.savingEntry.findFirstOrThrow({ where: { ledgerId: first.id } }))
-        .status,
+      (await db.savingEntry.require({ where: { ledgerId: first.id } })).status,
     ).toBe("pending");
     await expect(
       save("ledger", {
@@ -108,13 +110,12 @@ describe("数据库事务和权限", () => {
       date: localDate(),
     });
     expect(
-      (await db.savingEntry.findFirstOrThrow({ where: { ledgerId: first.id } }))
-        .status,
+      (await db.savingEntry.require({ where: { ledgerId: first.id } })).status,
     ).toBe("revoked");
   });
   it("跨用户批量修改会整体回滚", async () => {
     const own: any = await save("lists", { name: "保持原名" });
-    const foreign = await db.shoppingList.create({
+    const foreign = await db.shoppingList.insert({
       data: { ownerId: other.id, name: "他人清单" },
     });
     await expect(
@@ -130,8 +131,58 @@ describe("数据库事务和权限", () => {
       }),
     ).rejects.toThrow("无权访问");
     expect(
-      (await db.shoppingList.findUniqueOrThrow({ where: { id: own.id } })).name,
+      (await db.shoppingList.require({ where: { id: own.id } })).name,
     ).toBe("保持原名");
+  });
+  it("手动添加和编辑账本可选择分组，且不能使用他人分组", async () => {
+    const group: any = await mutate(user, {
+      action: "groupSave",
+      name: "旅行",
+      operationId: op(),
+    });
+    const entry: any = await save("ledger", {
+      type: "expense",
+      title: "分组账单",
+      amount: 1000,
+      date: localDate(),
+      groupId: group.id,
+    });
+    expect(entry.groupId).toBe(group.id);
+    const inherited: any = await save("ledger", {
+      type: "refund",
+      title: "退款跟随分组",
+      amount: 100,
+      refundOfId: entry.id,
+      date: localDate(),
+    });
+    expect(inherited.groupId).toBe(group.id);
+    const explicit: any = await save("ledger", {
+      type: "refund",
+      title: "退款指定未分组",
+      amount: 100,
+      refundOfId: entry.id,
+      date: localDate(),
+      groupId: null,
+    });
+    expect(explicit.groupId).toBeNull();
+    const edited: any = await save(
+      "ledger",
+      { groupId: null },
+      { id: entry.id, version: entry.version },
+    );
+    expect(edited.groupId).toBeNull();
+    const foreign = await db.recordGroup.insert({
+      data: { ownerId: other.id, name: "他人分组" },
+    });
+    await expect(
+      save("ledger", {
+        type: "expense",
+        title: "越权分组",
+        amount: 1000,
+        date: localDate(),
+        groupId: foreign.id,
+      }),
+    ).rejects.toThrow("无权访问");
   });
   it("购物转换一次性生成支出、物品和无重叠的省钱", async () => {
     const list: any = await save("lists", { name: "购物测试" });
@@ -159,7 +210,7 @@ describe("数据库事务和权限", () => {
     expect(
       await db.ownedItem.count({ where: { id: result.ownedItemId } }),
     ).toBe(1);
-    const savings = await db.savingEntry.findMany({
+    const savings = await db.savingEntry.list({
       where: {
         OR: [{ shoppingItemId: item.id }, { ledgerId: result.ledgerId }],
       },
@@ -191,8 +242,7 @@ describe("数据库事务和权限", () => {
       comment: "同意",
     });
     expect(
-      (await db.reviewRequest.findUniqueOrThrow({ where: { id: review.id } }))
-        .status,
+      (await db.reviewRequest.require({ where: { id: review.id } })).status,
     ).toBe("approved");
     await expect(
       vote(other, review.token, {
@@ -209,7 +259,7 @@ describe("数据库事务和权限", () => {
       data: { name: "牛奶", quantity: "两盒", listId: "外部指定无效清单" },
       warnings: [],
     };
-    const draft = await db.captureDraft.create({
+    const draft = await db.captureDraft.insert({
       data: {
         ownerId: user.id,
         target: "shopping",
@@ -228,14 +278,14 @@ describe("数据库事务和权限", () => {
     };
     await applyDraft(user, body);
     await applyDraft(user, body);
-    const result = await db.captureDraft.findUniqueOrThrow({
+    const result = await db.captureDraft.require({
       where: { id: draft.id },
     });
     expect(result.capturedAt.toISOString()).toBe("2026-11-09T15:30:00.000Z");
     expect(result.state).toBe("applied");
     expect(
       (
-        await db.shoppingItem.findFirstOrThrow({
+        await db.shoppingItem.require({
           where: { sourceDraftId: draft.id },
         })
       ).listId,
@@ -245,7 +295,7 @@ describe("数据库事务和权限", () => {
     ).rejects.toThrow("已更新");
   });
   it("未到期的处理中草稿不会重复调用模型", async () => {
-    const draft = await db.captureDraft.create({
+    const draft = await db.captureDraft.insert({
       data: {
         ownerId: user.id,
         text: "测试领取",
@@ -259,6 +309,121 @@ describe("数据库事务和权限", () => {
       id: draft.id,
       skipped: true,
     });
+  });
+  it("同一条原话可分别确认物品和依赖提醒，并保存真实物品映射", async () => {
+    const itemCandidate = {
+      target: "items",
+      data: {
+        name: "牛奶",
+        quantity: 6,
+        unit: "盒",
+        storageEnabled: true,
+        location: "冰箱",
+        expiryEnabled: true,
+        expiresOn: "2026-12-01",
+        costEnabled: false,
+      },
+      warnings: [],
+    };
+    const reminderCandidate = {
+      target: "reminder",
+      dependsOn: 0,
+      data: {
+        dependsOnName: "牛奶",
+        triggerType: "relative",
+        offsetDays: 1,
+        localTime: "09:00",
+        timezone: "Asia/Shanghai",
+      },
+      warnings: [],
+    };
+    const draft = await db.captureDraft.insert({
+      data: {
+        ownerId: user.id,
+        target: "auto",
+        text: "买了六盒牛奶放冰箱，12月1日到期，提前一天提醒",
+        capturedAt: new Date(),
+        state: "ready",
+        result: JSON.stringify([itemCandidate, reminderCandidate]),
+      },
+    });
+    const result: any = await applyDraft(user, {
+      operationId: op(),
+      id: draft.id,
+      version: draft.version,
+      selections: [
+        { index: 0, candidate: itemCandidate },
+        { index: 1, candidate: reminderCandidate },
+      ],
+    });
+    expect(result.saved).toHaveLength(2);
+    const item = await db.ownedItem.require({
+      where: { sourceDraftId: draft.id },
+    });
+    expect(item).toMatchObject({
+      name: "牛奶",
+      quantity: 6,
+      location: "冰箱",
+      expiresOn: "2026-12-01",
+    });
+    const rule = await db.reminderRule.require({
+      where: { ownerId: user.id, targetId: item.id },
+    });
+    expect(rule).toMatchObject({
+      targetType: "item",
+      triggerType: "relative",
+      offsetDays: 1,
+    });
+    const savedDraft = await db.captureDraft.require({
+      where: { id: draft.id },
+    });
+    expect(JSON.parse(savedDraft.result)[0].savedId).toBe(item.id);
+  });
+  it("物品更新候选按版本修改数量与位置，不新增物品", async () => {
+    const item: any = await save("items", {
+      name: "洗衣液",
+      quantity: 1,
+      unit: "瓶",
+      storageEnabled: true,
+      location: "卫生间",
+      costEnabled: false,
+      status: "active",
+    });
+    const candidate = {
+      target: "itemUpdate",
+      data: {
+        itemId: item.id,
+        itemVersion: item.version,
+        quantity: 2,
+        location: "阳台",
+      },
+      warnings: [],
+    };
+    const draft = await db.captureDraft.insert({
+      data: {
+        ownerId: user.id,
+        target: "auto",
+        text: "洗衣液还剩两瓶，挪到阳台了",
+        capturedAt: new Date(),
+        state: "ready",
+        result: JSON.stringify([candidate]),
+      },
+    });
+    await applyDraft(user, {
+      operationId: op(),
+      id: draft.id,
+      version: draft.version,
+      selections: [{ index: 0, candidate }],
+    });
+    const updated = await db.ownedItem.require({ where: { id: item.id } });
+    expect(updated).toMatchObject({
+      quantity: 2,
+      location: "阳台",
+      storageEnabled: true,
+    });
+    expect(
+      await db.ownedItem.count({ where: { ownerId: user.id, name: "洗衣液" } }),
+    ).toBe(1);
   });
   it("AI 可选字段可安全归一化，必填金额不被擅自修正", () => {
     const result = normalizeCandidate({
@@ -279,7 +444,7 @@ describe("数据库事务和权限", () => {
       grossAmount: 10000,
       date: localDate(),
     });
-    const saving = await db.savingEntry.findFirstOrThrow({
+    const saving = await db.savingEntry.require({
       where: { ledgerId: entry.id },
     });
     await mutate(user, {
@@ -295,8 +460,7 @@ describe("数据库事务和权限", () => {
       { id: entry.id, version: entry.version },
     );
     expect(
-      (await db.savingEntry.findUniqueOrThrow({ where: { id: saving.id } }))
-        .suppressed,
+      (await db.savingEntry.require({ where: { id: saving.id } })).suppressed,
     ).toBe(true);
     expect(
       await db.savingEntry.count({
@@ -305,7 +469,7 @@ describe("数据库事务和权限", () => {
     ).toBe(0);
   });
   it("最后一票并发不会超过目标人数", async () => {
-    const third = await db.user.create({
+    const third = await db.user.insert({
       data: { username: `concurrent-${op()}`, passwordHash: "test-only" },
     });
     try {
@@ -342,9 +506,9 @@ describe("数据库事务和权限", () => {
         await db.reviewVote.count({ where: { reviewId: review.id } }),
       ).toBe(1);
     } finally {
-      await db.reviewVote.deleteMany({ where: { userId: third.id } });
-      await db.appliedOperation.deleteMany({ where: { ownerId: third.id } });
-      await db.user.delete({ where: { id: third.id } });
+      await db.reviewVote.removeAll({ where: { userId: third.id } });
+      await db.appliedOperation.removeAll({ where: { ownerId: third.id } });
+      await db.user.remove({ where: { id: third.id } });
     }
   });
   it("批量中途业务失败会回滚前面的写入", async () => {
@@ -379,9 +543,9 @@ describe("数据库事务和权限", () => {
         ],
       }),
     ).rejects.toThrow("不能小于");
-    expect(
-      (await db.ledgerEntry.findUniqueOrThrow({ where: { id: a.id } })).note,
-    ).toBe("");
+    expect((await db.ledgerEntry.require({ where: { id: a.id } })).note).toBe(
+      "",
+    );
   });
   it("不买和降级省钱可只填计划与实际，自动推导金额不影响账本", async () => {
     const before = await db.ledgerEntry.count({ where: { ownerId: user.id } });
@@ -428,7 +592,7 @@ describe("数据库事务和权限", () => {
       },
       warnings: [],
     };
-    const draft = await db.captureDraft.create({
+    const draft = await db.captureDraft.insert({
       data: {
         ownerId: user.id,
         target: "auto",
@@ -444,7 +608,7 @@ describe("数据库事务和权限", () => {
       version: draft.version,
       selections: [{ index: 0, candidate }],
     });
-    const purchased = await db.shoppingItem.findUniqueOrThrow({
+    const purchased = await db.shoppingItem.require({
       where: { id: item.id },
     });
     expect(purchased.status).toBe("purchased");
@@ -484,7 +648,7 @@ describe("数据库事务和权限", () => {
     expect(converted.purchaseDiscount).toBe(2000);
     expect(converted.purchasedAt).toBe(localDate());
     expect(converted.categoryId).toBe(category.id);
-    const linked = await db.ledgerEntry.findUniqueOrThrow({
+    const linked = await db.ledgerEntry.require({
       where: { id: converted.ledgerId },
     });
     expect(linked.categoryId).toBe(category.id);
@@ -495,7 +659,7 @@ describe("数据库事务和权限", () => {
       mode: "delete",
       records: [{ id: linked.id, version: linked.version }],
     });
-    const preserved = await db.shoppingItem.findUniqueOrThrow({
+    const preserved = await db.shoppingItem.require({
       where: { id: item.id },
     });
     expect(preserved.status).toBe("purchased");
@@ -525,7 +689,7 @@ describe("数据库事务和权限", () => {
         where: { ownerId: user.id, id: relinked.entry.id },
       }),
     ).toBe(1);
-    const repaired = await db.shoppingItem.findUniqueOrThrow({
+    const repaired = await db.shoppingItem.require({
       where: { id: item.id },
     });
     expect(repaired.ledgerId).toBe(relinked.entry.id);
@@ -575,7 +739,7 @@ describe("数据库事务和权限", () => {
     });
     expect(edited.purchaseAmount).toBe(22000);
     expect(edited.categoryId).toBe(secondCategory.id);
-    const ledger = await db.ledgerEntry.findUniqueOrThrow({
+    const ledger = await db.ledgerEntry.require({
       where: { id: converted.ledgerId },
     });
     expect(ledger.amount).toBe(22000);
@@ -583,7 +747,7 @@ describe("数据库事务和权限", () => {
     expect(ledger.discount).toBe(500);
     expect(
       (
-        await db.ownedItem.findUniqueOrThrow({
+        await db.ownedItem.require({
           where: { id: converted.ownedItemId },
         })
       ).price,
@@ -716,7 +880,7 @@ describe("数据库事务和权限", () => {
     });
     expect(
       (
-        await db.ledgerEntry.findUniqueOrThrow({
+        await db.ledgerEntry.require({
           where: { id: converted.ledgerId },
         })
       ).categoryId,
@@ -729,7 +893,7 @@ describe("数据库事务和权限", () => {
     expect(changed.categoryId).toBe(second.id);
     expect(
       (
-        await db.ledgerEntry.findUniqueOrThrow({
+        await db.ledgerEntry.require({
           where: { id: converted.ledgerId },
         })
       ).categoryId,
@@ -737,7 +901,7 @@ describe("数据库事务和权限", () => {
   });
   it("草稿可以修改目标模块与清单，也能生成手动整理候选", async () => {
     const list: any = await save("lists", { name: "草稿归属测试" });
-    const draft = await db.captureDraft.create({
+    const draft = await db.captureDraft.insert({
       data: {
         ownerId: user.id,
         text: "原本记在账本",
@@ -770,5 +934,457 @@ describe("数据库事务和权限", () => {
     expect(candidates[0].target).toBe("shopping");
     expect(candidates[0].data.name).toBe("手动候选物品");
     expect(candidates[0].data.listId).toBe(list.id);
+  });
+});
+
+describe("生活管家第 0～2 期回归", () => {
+  it("物品可选日期和箱子留空时按未设置保存", async () => {
+    const item: any = await save("items", {
+      name: `空可选值-${op().slice(0, 8)}`,
+      quantity: 2,
+      unit: "件",
+      storageEnabled: true,
+      location: "卧室 / 衣柜上层",
+      boxId: "",
+      expiryEnabled: false,
+      expiresOn: "",
+      costEnabled: false,
+      purchaseDate: "",
+      price: null,
+      retiredDate: "",
+    });
+    expect(item.boxId).toBeNull();
+    expect(item.expiresOn).toBeNull();
+    expect(item.retiredDate).toBeNull();
+    expect(item.purchaseDate).toBeNull();
+    expect(item.quantity).toBe(2);
+    expect(item.quantityConfirmedAt).toBeInstanceOf(Date);
+  });
+
+  it("购物数量只作描述，账本保存本次实际付款，并可顺手登记多条物品", async () => {
+    const suffix = op().slice(0, 8);
+    const milk = `牛奶-${suffix}`;
+    const soap = `洗衣液-${suffix}`;
+    const operationId = op();
+    const body = {
+      action: "save",
+      entity: "ledger",
+      operationId,
+      data: {
+        type: "expense",
+        title: `超市采购-${suffix}`,
+        amount: 20000,
+        date: localDate(),
+        items: [
+          {
+            name: milk,
+            quantity: 6,
+            unit: "盒",
+            storageEnabled: true,
+            location: "冰箱",
+            expiryEnabled: true,
+            expiresOn: addDays(localDate(), 10),
+            costEnabled: false,
+          },
+          {
+            name: soap,
+            quantity: 1,
+            unit: "瓶",
+            storageEnabled: true,
+            location: "阳台",
+            costEnabled: false,
+          },
+        ],
+      },
+    };
+    const first: any = await mutate(user, body);
+    const retried: any = await mutate(user, body);
+    expect(retried.id).toBe(first.id);
+    expect(first.amount).toBe(20000);
+    const items = await db.ownedItem.list({
+      where: { ownerId: user.id, name: { in: [milk, soap] } },
+    });
+    expect(items).toHaveLength(2);
+    expect(items.every((item) => item.price == null)).toBe(true);
+    expect(items.every((item) => item.ledgerId == null)).toBe(true);
+    expect(items.find((item) => item.name === milk)?.quantity).toBe(6);
+    expect(items.find((item) => item.name === milk)?.sourceNote).toContain(
+      "超市采购",
+    );
+    const edited: any = await save(
+      "ledger",
+      { note: "只改备注" },
+      { id: first.id, version: first.version },
+    );
+    expect(edited.note).toBe("只改备注");
+    expect(
+      await db.ownedItem.count({
+        where: { ownerId: user.id, name: { in: [milk, soap] } },
+      }),
+    ).toBe(2);
+  });
+
+  it("顺手登记独立成本时逐行保存价格，不按账单金额分摊", async () => {
+    const suffix = op().slice(0, 8);
+    const names = [`独立甲-${suffix}`, `独立乙-${suffix}`];
+    await save("ledger", {
+      type: "expense",
+      title: `独立成本账单-${suffix}`,
+      amount: 30000,
+      date: localDate(),
+      items: [
+        {
+          name: names[0],
+          quantity: 1,
+          unit: "件",
+          costEnabled: true,
+          price: 12000,
+          purchaseDate: localDate(),
+        },
+        {
+          name: names[1],
+          quantity: 1,
+          unit: "件",
+          costEnabled: true,
+          price: 8000,
+          purchaseDate: localDate(),
+        },
+      ],
+    });
+    const items = await db.ownedItem.list({
+      where: { ownerId: user.id, name: { in: names } },
+    });
+    expect(
+      items.map((item) => item.price ?? 0).sort((a, b) => a - b),
+    ).toEqual([8000, 12000]);
+    expect(items.every((item) => item.ledgerId == null)).toBe(true);
+  });
+
+  it("顺手登记中途失败会回滚账单和物品", async () => {
+    const suffix = op().slice(0, 8);
+    const before = await db.ledgerEntry.count({ where: { ownerId: user.id } });
+    await expect(
+      save("ledger", {
+        type: "expense",
+        title: `回滚登记-${suffix}`,
+        amount: 1000,
+        date: localDate(),
+        items: [
+          { name: `有效-${suffix}`, quantity: 1, unit: "件" },
+          {
+            name: `缺到期日-${suffix}`,
+            quantity: 1,
+            unit: "件",
+            expiryEnabled: true,
+          },
+        ],
+      }),
+    ).rejects.toThrow("到期日");
+    expect(await db.ledgerEntry.count({ where: { ownerId: user.id } })).toBe(
+      before,
+    );
+    expect(
+      await db.ownedItem.count({
+        where: { ownerId: user.id, name: { contains: suffix } },
+      }),
+    ).toBe(0);
+  });
+
+  it("出行清单拒绝购买和结算，复制时重置完成状态且不复制提醒", async () => {
+    const suffix = op().slice(0, 8);
+    const travel: any = await save("lists", {
+      name: `海边-${suffix}`,
+      kind: "travel",
+      departureDate: addDays(localDate(), 5),
+    });
+    const item: any = await save("shopping", {
+      listId: travel.id,
+      name: `证件-${suffix}`,
+      quantity: "1 份",
+      groupName: "证件",
+      done: false,
+    });
+    expect(item.budget).toBeNull();
+    await expect(
+      mutate(user, {
+        action: "convert",
+        operationId: op(),
+        id: item.id,
+        version: item.version,
+        mode: "buy",
+        paid: 100,
+        date: localDate(),
+      }),
+    ).rejects.toThrow("只有购物清单");
+    await expect(
+      mutate(user, {
+        action: "listCheckoutPreview",
+        operationId: op(),
+        id: travel.id,
+        version: travel.version,
+        rows: [{ id: item.id, version: item.version, paid: 100, date: localDate() }],
+      }),
+    ).rejects.toThrow("只有购物清单");
+    await expect(
+      mutate(user, {
+        action: "listSettlementPreview",
+        operationId: op(),
+        id: travel.id,
+      }),
+    ).rejects.toThrow("只有购物清单");
+    const rule: any = await mutate(user, {
+      action: "reminderSave",
+      operationId: op(),
+      targetType: "listItem",
+      targetId: item.id,
+      triggerType: "fixed",
+      fixedAt: new Date(Date.now() - 60_000).toISOString(),
+      timezone: "Asia/Shanghai",
+    });
+    const copy: any = await mutate(user, {
+      action: "copyList",
+      operationId: op(),
+      id: travel.id,
+      version: travel.version,
+      resetDone: true,
+      departureDate: addDays(localDate(), 8),
+    });
+    const copied = await db.shoppingItem.first({
+      where: { ownerId: user.id, listId: copy.id },
+    });
+    expect(copy.kind).toBe("travel");
+    expect(copied?.done).toBe(false);
+    expect(
+      await db.reminderRule.count({
+        where: { ownerId: user.id, targetType: "listItem", targetId: copied!.id },
+      }),
+    ).toBe(0);
+    expect(
+      await db.reminderRule.count({ where: { ownerId: user.id, id: rule.id } }),
+    ).toBe(1);
+  });
+
+  it("购物复制不继承账单、物品成本、结算或省钱关系", async () => {
+    const suffix = op().slice(0, 8);
+    const list: any = await save("lists", {
+      name: `购物-${suffix}`,
+      kind: "shopping",
+      budget: 10000,
+    });
+    const item: any = await save("shopping", {
+      listId: list.id,
+      name: `咖啡-${suffix}`,
+      budget: 10000,
+    });
+    const bought: any = await mutate(user, {
+      action: "convert",
+      operationId: op(),
+      id: item.id,
+      version: item.version,
+      mode: "buy",
+      paid: 8000,
+      date: localDate(),
+      createLedger: true,
+      createItem: true,
+      createSaving: true,
+      planned: 10000,
+    });
+    expect(bought.ledgerId).toBeTruthy();
+    const copy: any = await mutate(user, {
+      action: "copyList",
+      operationId: op(),
+      id: list.id,
+      version: list.version,
+      resetDone: true,
+    });
+    const copied = await db.shoppingItem.first({
+      where: { ownerId: user.id, listId: copy.id },
+    });
+    expect(copied?.status).toBe("planned");
+    expect(copied?.ledgerId).toBeNull();
+    expect(copied?.ownedItemId).toBeNull();
+    expect(copied?.purchaseAmount).toBeNull();
+    expect(
+      await db.savingEntry.count({
+        where: { ownerId: user.id, shoppingItemId: copied!.id },
+      }),
+    ).toBe(0);
+  });
+
+  it("提醒重载、重复检查、稍后提醒和已处理状态持久化", async () => {
+    const item: any = await save("items", {
+      name: `提醒物品-${op().slice(0, 8)}`,
+      expiryEnabled: true,
+      expiresOn: localDate(),
+      costEnabled: false,
+    });
+    const rule: any = await mutate(user, {
+      action: "reminderSave",
+      operationId: op(),
+      targetType: "item",
+      targetId: item.id,
+      triggerType: "fixed",
+      fixedAt: new Date(Date.now() - 60_000).toISOString(),
+      timezone: "Asia/Shanghai",
+    });
+    const first: any = await mutate(user, { action: "reminderCheck" });
+    const visible = first.reminders.find(
+      (row: any) => row.ruleId === rule.id,
+    );
+    expect(visible).toBeTruthy();
+    const second: any = await mutate(user, { action: "reminderCheck" });
+    expect(
+      second.reminders.find((row: any) => row.ruleId === rule.id)?.id,
+    ).toBe(visible.id);
+    expect(
+      await db.reminderOccurrence.count({
+        where: { ownerId: user.id, ruleId: rule.id },
+      }),
+    ).toBe(1);
+    const until = new Date(Date.now() + 3_600_000).toISOString();
+    await mutate(user, {
+      action: "reminderHandle",
+      operationId: op(),
+      id: visible.id,
+      mode: "snooze",
+      until,
+    });
+    expect(
+      (
+        await mutate(user, { action: "reminderCheck" })
+      ).reminders.some((row: any) => row.ruleId === rule.id),
+    ).toBe(false);
+    expect(
+      (
+        await mutate(user, { action: "reminderCheck" })
+      ).reminders.some((row: any) => row.ruleId === rule.id),
+    ).toBe(false);
+    const snoozed = await db.reminderOccurrence.require({
+      where: { id: visible.id },
+    });
+    expect(snoozed.state).toBe("pending");
+    expect(snoozed.snoozedUntil?.toISOString()).toBe(until);
+    await mutate(user, {
+      action: "reminderHandle",
+      operationId: op(),
+      id: visible.id,
+      mode: "done",
+    });
+    const done: any = await mutate(user, { action: "reminderCheck" });
+    expect(done.reminders.some((row: any) => row.ruleId === rule.id)).toBe(
+      false,
+    );
+    expect(
+      (await db.reminderOccurrence.require({ where: { id: visible.id } }))
+        .state,
+    ).toBe("done");
+  });
+
+  it("多个阈值只显示最近一个，完成目标和修改目标日期会停止旧提醒", async () => {
+    const item: any = await save("items", {
+      name: `阈值物品-${op().slice(0, 8)}`,
+      expiryEnabled: true,
+      expiresOn: localDate(),
+      costEnabled: false,
+    });
+    const older: any = await mutate(user, {
+      action: "reminderSave",
+      operationId: op(),
+      targetType: "item",
+      targetId: item.id,
+      triggerType: "fixed",
+      fixedAt: new Date(Date.now() - 7_200_000).toISOString(),
+      timezone: "Asia/Shanghai",
+    });
+    const newer: any = await mutate(user, {
+      action: "reminderSave",
+      operationId: op(),
+      targetType: "item",
+      targetId: item.id,
+      triggerType: "fixed",
+      fixedAt: new Date(Date.now() - 60_000).toISOString(),
+      timezone: "Asia/Shanghai",
+    });
+    const checked: any = await mutate(user, { action: "reminderCheck" });
+    const visible = checked.reminders.filter(
+      (row: any) => row.targetId === item.id,
+    );
+    expect(visible).toHaveLength(1);
+    expect(visible[0].ruleId).toBe(newer.id);
+    expect(
+      (await db.reminderOccurrence.require({
+        where: { ownerId: user.id, ruleId: older.id },
+      })).state,
+    ).toBe("superseded");
+    await mutate(user, {
+      action: "reminderHandle",
+      operationId: op(),
+      id: visible[0].id,
+      mode: "done",
+    });
+    const relative: any = await mutate(user, {
+      action: "reminderSave",
+      operationId: op(),
+      targetType: "item",
+      targetId: item.id,
+      triggerType: "relative",
+      offsetDays: 0,
+      localTime: "00:00",
+      timezone: "Asia/Shanghai",
+    });
+    await mutate(user, { action: "reminderCheck" });
+    const changed: any = await save(
+      "items",
+      { expiresOn: addDays(localDate(), 1) },
+      { id: item.id, version: item.version },
+    );
+    const after: any = await mutate(user, { action: "reminderCheck" });
+    expect(
+      after.reminders.some((row: any) => row.ruleId === relative.id),
+    ).toBe(false);
+    expect(
+      after.rules.find((row: any) => row.id === relative.id)?.targetDate,
+    ).toBe(changed.expiresOn);
+    expect(
+      await db.reminderOccurrence.count({
+        where: { ownerId: user.id, ruleId: relative.id, state: "cancelled" },
+      }),
+    ).toBe(1);
+  });
+
+  it("跨用户收纳箱和提醒目标均被拒绝", async () => {
+    const foreignBox: any = await db.storageBox.insert({
+      data: { ownerId: other.id, name: `他人箱-${op().slice(0, 8)}` },
+    });
+    const foreignItem: any = await db.ownedItem.insert({
+      data: {
+        ownerId: other.id,
+        name: `他人物品-${op().slice(0, 8)}`,
+        expiryEnabled: true,
+        expiresOn: localDate(),
+        costEnabled: false,
+        purchaseDate: null,
+        price: null,
+      },
+    });
+    await expect(
+      save("items", {
+        name: `越权装箱-${op().slice(0, 8)}`,
+        storageEnabled: true,
+        boxId: foreignBox.id,
+        costEnabled: false,
+      }),
+    ).rejects.toThrow("无权访问");
+    await expect(
+      mutate(user, {
+        action: "reminderSave",
+        operationId: op(),
+        targetType: "item",
+        targetId: foreignItem.id,
+        triggerType: "fixed",
+        fixedAt: new Date(Date.now() + 60_000).toISOString(),
+        timezone: "Asia/Shanghai",
+      }),
+    ).rejects.toThrow("无权访问");
   });
 });

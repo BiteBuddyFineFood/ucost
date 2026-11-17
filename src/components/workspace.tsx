@@ -1,11 +1,15 @@
 "use client";
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   BookOpen,
   ChartNoAxesCombined,
   ShoppingBasket,
   Package,
+  Archive,
+  CalendarClock,
+  Bell,
+  Plane,
   PiggyBank,
   Inbox,
   Settings,
@@ -17,7 +21,18 @@ import {
   Pencil,
   Trash2,
   Check,
+  Copy,
   Share2,
+  Ticket,
+  TicketCheck,
+  Eye,
+  EyeOff,
+  KeyRound,
+  UserRound,
+  ArrowRight,
+  SlidersHorizontal,
+  Search,
+  Ellipsis,
 } from "lucide-react";
 import {
   api,
@@ -31,6 +46,14 @@ import {
   CategoryMark,
 } from "./ui";
 import Dashboard from "./dashboard";
+import {
+  AllItemsModal,
+  ExpiryPage,
+  ItemEditor,
+  ReminderCenter,
+  ReminderEditor,
+  StoragePage,
+} from "./household";
 import { ExchangePanel } from "./exchange";
 import {
   GroupControls,
@@ -41,6 +64,19 @@ import {
   AiStatus,
 } from "./enhancements";
 import { Capture, DraftInbox, DraftSection } from "./capture";
+import Assistant from "./assistant";
+import { answerAssistant } from "@/lib/assistant";
+import {
+  navigationFor,
+  navigationLabels,
+  type NavigationKey,
+} from "@/lib/navigation";
+import {
+  CollapsibleSection,
+  useFoldPreference,
+  useLayoutMode,
+} from "./collapsible";
+import { NavigationSettings } from "./navigation-settings";
 import {
   entryTypes,
   heldDays,
@@ -51,25 +87,40 @@ import {
   sourceLabels,
   reviewStates,
   effectiveSaving,
+  itemCostView,
 } from "@/lib/domain";
 
+const navigationIcons = {
+  dashboard: ChartNoAxesCombined,
+  ledger: BookOpen,
+  shopping: ShoppingBasket,
+  items: Package,
+  storage: Archive,
+  expiry: CalendarClock,
+  savings: PiggyBank,
+  reminders: Bell,
+  drafts: Inbox,
+  settings: Settings,
+};
+type PageKey = NavigationKey | "settings";
 const navigation = [
-  { key: "dashboard", name: "统计", icon: ChartNoAxesCombined },
-  { key: "ledger", name: "账本", icon: BookOpen },
-  { key: "shopping", name: "购物清单", icon: ShoppingBasket },
-  { key: "items", name: "物品成本", icon: Package },
-  { key: "savings", name: "省钱罐", icon: PiggyBank },
-  { key: "drafts", name: "待整理", icon: Inbox },
-  { key: "settings", name: "设置", icon: Settings },
+  ...Object.entries(navigationIcons).map(([key, icon]) => ({
+    key: key as PageKey,
+    name: navigationLabels[key as NavigationKey] || "设置",
+    icon,
+  })),
 ];
 const pageCopy: Record<string, [string, string]> = {
   dashboard: ["日常，慢慢有数。", "记下每一笔，也照顾每一个小愿望。"],
   ledger: ["一笔一笔，都是生活。", "收入、支出与退款，清清楚楚。"],
-  shopping: ["想买的，先放这里。", "留一点时间，把需要和喜欢想明白。"],
+  shopping: ["想买的、要带的，都先放这里。", "购物记账，出行和日常准备各自清楚。"],
   items: ["好东西，陪你久一点。", "看看每一天、每一次使用的成本。"],
+  storage: ["东西有归处，找起来不慌。", "按位置和箱子整理，不要求先有账单。"],
+  expiry: ["先吃掉快到期的。", "到期当天仍算今天到期，不提前报过期。"],
   savings: ["省下来的，也值得记。", "优惠、不买与降级，分开记录每一种决定。"],
+  reminders: ["该处理的事，放在眼前。", "只在网页内提醒，打开或回到页面时补查。"],
   drafts: ["先记下来，不着急。", "原话和时间都在，等你有空再整理。"],
-  settings: ["按你的习惯来。", "账户、分类和 AI 整理，都在这里。"],
+  settings: ["按你的习惯来。", "账户、分类、邀请码和 AI 整理，都在这里。"],
 };
 
 export default function Workspace() {
@@ -78,7 +129,8 @@ export default function Workspace() {
     [page, setPage] = useState("dashboard"),
     [error, setError] = useState(""),
     [toast, setToast] = useState(""),
-    [more, setMore] = useState(false);
+    [more, setMore] = useState(false),
+    [assistantOpen, setAssistantOpen] = useState(false);
   const [editor, setEditor] = useState<any>(null),
     [capture, setCapture] = useState<any>(null),
     [batch, setBatch] = useState(false),
@@ -88,37 +140,133 @@ export default function Workspace() {
     [category, setCategory] = useState("all"),
     [account, setAccount] = useState("all"),
     [listId, setListId] = useState<string | null>(null),
+    [listKind, setListKind] = useState("all"),
     [showArchived, setShowArchived] = useState(false),
     [pageIndex, setPageIndex] = useState(0),
     [conversion, setConversion] = useState<any>(null),
     [purchaseEdit, setPurchaseEdit] = useState<any>(null),
     [purchaseRelink, setPurchaseRelink] = useState<any>(null),
     [purchaseUndo, setPurchaseUndo] = useState<any>(null),
+    [purchaseReference, setPurchaseReference] = useState<any>(null),
     [reviewItem, setReviewItem] = useState<any>(null),
     [usageItem, setUsageItem] = useState<any>(null),
-    [resolveSaving, setResolveSaving] = useState<any>(null);
+    [resolveSaving, setResolveSaving] = useState<any>(null),
+    [itemEditor, setItemEditor] = useState<any>(null),
+    [allItems, setAllItems] = useState(false),
+    [copyListTarget, setCopyListTarget] = useState<any>(null),
+    [listWizard, setListWizard] = useState(false),
+    [reminderEditor, setReminderEditor] = useState<any>(null),
+    [reminderData, setReminderData] = useState<any>({
+      reminders: [],
+      rules: [],
+    });
   const [classification, setClassification] = useState(false),
     [fullGroup, setFullGroup] = useState<string | null>(null);
   const [groupLimits, setGroupLimits] = useState<Record<string, number>>({});
+  const layoutMode = useLayoutMode();
+  const [moreOpen, setMoreOpen] = useState(false);
+  const userId = state?.user?.id || "guest";
   const [dates, setDates] = useState({
     start: `${localDate().slice(0, 7)}-01`,
     end: localDate(),
   });
+  const navigationPrefs = useMemo(
+    () => navigationFor(state?.user?.preferences),
+    [state?.user?.preferences],
+  );
+  const layoutNavigation = navigationPrefs[layoutMode];
+  const pageEntry = (key: PageKey) =>
+    navigation.find((entry) => entry.key === key);
+  const filterKey =
+    page === "shopping" && !listId ? "shopping" : `${page}:${listId || ""}`;
+  const filterFold = useFoldPreference(
+    filterKey,
+    layoutMode === "desktop",
+    layoutMode,
+    userId,
+  );
+  const actionsFold = useFoldPreference(
+    `actions:${filterKey}`,
+    layoutMode === "desktop",
+    layoutMode,
+    userId,
+  );
+  const savingFold = useFoldPreference(
+    "savings-summary",
+    false,
+    layoutMode,
+    userId,
+  );
+  const draftFold = useFoldPreference(
+    `drafts:${filterKey}`,
+    false,
+    layoutMode,
+    userId,
+  );
+  const listContextFold = useFoldPreference(
+    "shopping-context",
+    false,
+    layoutMode,
+    userId,
+  );
+  const listBudgetFold = useFoldPreference(
+    `shopping-budget:${listId || ""}`,
+    layoutMode === "desktop",
+    layoutMode,
+    userId,
+  );
+  const moreContainsPage =
+    layoutNavigation.more.includes(page as NavigationKey) ||
+    page === "settings" ||
+    assistantOpen;
+  useEffect(() => {
+    if (moreContainsPage || assistantOpen) setMoreOpen(true);
+  }, [moreContainsPage, assistantOpen]);
   const refresh = useCallback(async () => {
     try {
       const result = await api("state");
       setState(result);
       setError("");
+      return result;
     } catch (e) {
       if ((e as Error).message === "请先登录") setState(null);
       else setError((e as Error).message);
+      return null;
     } finally {
       setLoading(false);
+    }
+  }, []);
+  const checkReminders = useCallback(async () => {
+    try {
+      const result = await api("mutate", { action: "reminderCheck" });
+      setReminderData(result);
+      return result;
+    } catch (e) {
+      setError((e as Error).message);
+      return { reminders: [], rules: [] };
     }
   }, []);
   useEffect(() => {
     refresh();
   }, [refresh]);
+  useEffect(() => {
+    if (!userId) return;
+    checkReminders();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") checkReminders();
+    };
+    const onFocus = () => checkReminders();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") checkReminders();
+    }, 60_000);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+      window.clearInterval(timer);
+    };
+  }, [userId, checkReminders]);
   useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(""), 3500);
@@ -131,14 +279,83 @@ export default function Workspace() {
     setType("all");
     setCategory("all");
     setAccount("all");
+    setListKind("all");
     setPageIndex(0);
     setMore(false);
     setFullGroup(null);
+  }
+  function openAssistantReference(reference: any) {
+    const closeOnMobile = () => {
+      if (window.matchMedia("(max-width: 800px)").matches)
+        setAssistantOpen(false);
+    };
+    if (reference.type === "item") {
+      const record = state.items.find((item: any) => item.id === reference.id);
+      if (record) setItemEditor({ record });
+      setAssistantOpen(false);
+      return;
+    }
+    if (reference.type === "list") {
+      navigate("shopping");
+      setListId(reference.id);
+      closeOnMobile();
+      return;
+    }
+    if (reference.type === "ledger") {
+      if (reference.id) {
+        const record = state.ledger.find(
+          (entry: any) => entry.id === reference.id,
+        );
+        if (record) {
+          setEditor({ entity: "ledger", record });
+          setAssistantOpen(false);
+          return;
+        }
+      }
+      navigate("ledger");
+      if (reference.start && reference.end)
+        setDates({ start: reference.start, end: reference.end });
+      closeOnMobile();
+      return;
+    }
+    if (reference.type === "shopping") {
+      const record = state.shopping.find(
+        (item: any) => item.id === reference.id,
+      );
+      navigate("shopping");
+      if (record?.listId) setListId(record.listId);
+      closeOnMobile();
+      return;
+    }
+    if (reference.type === "page") {
+      navigate(reference.page);
+      if (reference.page === "shopping") setListId(null);
+      closeOnMobile();
+      return;
+    }
+    if (reference.type === "reminders") {
+      navigate("reminders");
+      checkReminders();
+      closeOnMobile();
+    }
+  }
+  function openAssistantCapture(target: string, text?: string) {
+    setAssistantOpen(false);
+    setCapture({
+      target,
+      initialText: text,
+      listId:
+        target === "shopping" && page === "shopping" ? listId || undefined : undefined,
+    });
   }
   function toggle(id: string) {
     setSelection((s) =>
       s.includes(id) ? s.filter((x) => x !== id) : [...s, id],
     );
+  }
+  function openRecordEditor(record: any) {
+    if (entity === "items") setItemEditor({ record });
+    else setEditor({ entity, record });
   }
   async function mutate(body: any) {
     const result = await api("mutate", {
@@ -194,21 +411,34 @@ export default function Workspace() {
   if (page === "shopping")
     records = listId
       ? records.filter((r) => r.listId === listId)
-      : records.filter((r) => showArchived || !r.archived);
+      : records.filter(
+          (r) =>
+            (showArchived || !r.archived) &&
+            (listKind === "all" || (r.kind || "shopping") === listKind),
+        );
+  if (page === "items")
+    records = records.filter((r) => r.costEnabled !== false);
   if (fullGroup !== null && ["ledger", "savings"].includes(page))
     records = (state[entity] || []).filter(
       (r: any) => (r.groupId || "") === fullGroup,
     );
-  const csvFilter = new URLSearchParams({ format: "csv", entity: page, scope: "filtered" });
+  const csvFilter = new URLSearchParams({
+    format: "csv",
+    entity: page,
+    scope: "filtered",
+  });
   if (fullGroup !== null) csvFilter.set("groupId", fullGroup || "none");
   else {
     csvFilter.set("start", dates.start);
     csvFilter.set("end", dates.end);
     if (query) csvFilter.set("q", query);
     if (type !== "all") csvFilter.set("type", type);
-    if (category !== "all") csvFilter.set(page === "ledger" ? "categoryId" : "source", category);
-    if (page === "ledger" && account !== "all") csvFilter.set("accountId", account);
-    if (page === "savings" && !showArchived) csvFilter.set("hideRevoked", "true");
+    if (category !== "all")
+      csvFilter.set(page === "ledger" ? "categoryId" : "source", category);
+    if (page === "ledger" && account !== "all")
+      csvFilter.set("accountId", account);
+    if (page === "savings" && !showArchived)
+      csvFilter.set("hideRevoked", "true");
   }
   const grouped =
     ["ledger", "savings"].includes(page) &&
@@ -230,8 +460,97 @@ export default function Workspace() {
   const selectedRecords = (state[entity] || []).filter((r: any) =>
     selection.includes(r.id),
   );
+  const isShoppingRecord = (record: any) =>
+    state.lists.find((row: any) => row.id === record.listId)?.kind !==
+    "travel" &&
+    state.lists.find((row: any) => row.id === record.listId)?.kind !==
+      "normal";
   const heading = pageCopy[page];
   const list = state.lists.find((l: any) => l.id === listId);
+  const desktopPageName =
+    page === "shopping" && list ? list.name : heading?.[0];
+  const mobilePageName =
+    page === "shopping" && list ? list.name : pageEntry(page as PageKey)?.name || heading?.[0];
+  const primaryAction =
+    page === "shopping" && !listId
+      ? {
+          label: "新建清单",
+          run: () => setEditor({ entity: "lists" }),
+        }
+      : page === "shopping" && listId
+        ? {
+            label: "添加物品",
+            run: () => setCapture({ target: "shopping", listId }),
+          }
+        : {
+            label: "快速记录",
+            run: () =>
+              setCapture({
+                target:
+                  page === "shopping"
+                    ? "shopping"
+                    : ["items", "storage", "expiry"].includes(page)
+                      ? "items"
+                      : page === "savings"
+                        ? "savings"
+                        : "ledger",
+                listId,
+              }),
+          };
+  const filterCategoryLabel =
+    category === "all"
+      ? ""
+      : page === "savings"
+        ? sourceLabels[category] || category
+        : category === "none"
+          ? "未分类"
+          : state.categories.find((c: any) => c.id === category)?.name || category;
+  const filterConditions = [
+    query,
+    page === "ledger" && type !== "all",
+    page === "ledger" && category !== "all",
+    page === "ledger" && account !== "all",
+    page === "savings" && type !== "all",
+    page === "savings" && category !== "all",
+    page === "shopping" && !listId && listKind !== "all",
+    ["ledger", "savings"].includes(page) &&
+      (dates.start !== `${localDate().slice(0, 7)}-01` ||
+        dates.end !== localDate()),
+    page === "savings" && showArchived,
+    page === "shopping" && !listId && showArchived,
+  ].filter(Boolean).length;
+  const filterSummary = [
+    query && `“${query}”`,
+    ["ledger", "savings"].includes(page) &&
+      (dates.start === `${localDate().slice(0, 7)}-01` &&
+      dates.end === localDate()
+        ? "本月"
+        : `${dates.start} 至 ${dates.end}`),
+    page === "shopping" &&
+      !listId &&
+      ({
+        all: "全部清单",
+        shopping: "购物",
+        travel: "出行",
+        normal: "普通",
+      } as Record<string, string>)[listKind],
+    page === "ledger" &&
+      (type === "all"
+        ? "全部类型"
+        : entryTypes[type as keyof typeof entryTypes]),
+    page === "savings" &&
+      (type === "all"
+        ? "全部类型"
+        : savingTypes[type as keyof typeof savingTypes]),
+    filterCategoryLabel,
+    page === "ledger" &&
+      account !== "all" &&
+      (account === "none"
+        ? "未指定账户"
+        : state.accounts.find((a: any) => a.id === account)?.name || account),
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const bulkButton = selection.length > 0 && (
     <div className="batch-bar">
       <span>已选 {selection.length} 条</span>
@@ -245,7 +564,7 @@ export default function Workspace() {
     </div>
   );
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${page === "settings" ? "is-settings" : ""}`}>
       <aside className="sidebar">
         <Link className="brand" href="/" aria-label="UCost 首页">
           <span className="brand-mark">
@@ -255,20 +574,79 @@ export default function Workspace() {
             UCost<small>日常有数</small>
           </span>
         </Link>
-        <div className="sidebar-caption">我的生活账页</div>
-        <nav>
-          {navigation.map((n) => (
-            <button
-              key={n.key}
-              className={page === n.key ? "active" : ""}
-              onClick={() => navigate(n.key)}
-            >
-              <n.icon size={19} strokeWidth={1.6} />
-              <span>{n.name}</span>
-              {n.key === "drafts" && pending > 0 && <em>{pending}</em>}
-            </button>
-          ))}
-        </nav>
+        <div className="sidebar-scroll">
+          <div className="sidebar-caption">我的生活账页</div>
+          <nav aria-label="电脑常用导航">
+            {layoutNavigation.main.map((key) => {
+              const entry = pageEntry(key);
+              if (!entry) return null;
+              const Icon = entry.icon;
+              return (
+                <button
+                  key={key}
+                  className={page === key ? "active" : ""}
+                  onClick={() => navigate(key)}
+                >
+                  <Icon size={19} strokeWidth={1.6} />
+                  <span>{entry.name}</span>
+                  {key === "drafts" && pending > 0 && <em>{pending}</em>}
+                  {key === "reminders" &&
+                    reminderData.reminders.length > 0 && (
+                      <em>{reminderData.reminders.length}</em>
+                    )}
+                </button>
+              );
+            })}
+          </nav>
+          <details
+            className="sidebar-more"
+            open={moreOpen}
+            onToggle={(event) => setMoreOpen(event.currentTarget.open)}
+          >
+            <summary>
+              <Ellipsis size={18} aria-hidden="true" />
+              <span>更多</span>
+              <ChevronRight size={15} className="sidebar-more-chevron" />
+            </summary>
+            <div className="sidebar-more-list">
+              {layoutNavigation.more.map((key) => {
+                const entry = pageEntry(key);
+                if (!entry) return null;
+                const Icon = entry.icon;
+                return (
+                  <button
+                    key={key}
+                    className={page === key ? "active" : ""}
+                    onClick={() => navigate(key)}
+                  >
+                    <Icon size={17} strokeWidth={1.6} />
+                    <span>{entry.name}</span>
+                    {key === "drafts" && pending > 0 && <em>{pending}</em>}
+                    {key === "reminders" &&
+                      reminderData.reminders.length > 0 && (
+                        <em>{reminderData.reminders.length}</em>
+                      )}
+                  </button>
+                );
+              })}
+              <button
+                className={page === "settings" ? "active" : ""}
+                onClick={() => navigate("settings")}
+              >
+                <Settings size={17} strokeWidth={1.6} />
+                <span>设置</span>
+              </button>
+              <button
+                className={`assistant-nav-entry ${assistantOpen ? "active" : ""}`}
+                onClick={() => setAssistantOpen(true)}
+                aria-expanded={assistantOpen}
+              >
+                <Sparkles size={17} strokeWidth={1.6} aria-hidden="true" />
+                <span>小数管家</span>
+              </button>
+            </div>
+          </details>
+        </div>
         <div className="sidebar-note">
           <svg viewBox="0 0 100 55" aria-hidden="true">
             <path
@@ -288,7 +666,7 @@ export default function Workspace() {
           <span className="avatar">{state.user.username.slice(0, 1)}</span>
           <span>
             {state.user.username}
-            <small>本地账本</small>
+            <small>生活账本</small>
           </span>
           <button
             className="icon-button"
@@ -316,27 +694,18 @@ export default function Workspace() {
                 timeZone: state.user.timezone,
               }).format(new Date())}
             </p>
-            <h1>{heading[0]}</h1>
-            <p>{heading[1]}</p>
+            <h1>
+              <span className="page-title-desktop">{desktopPageName}</span>
+              <span className="page-title-mobile">{mobilePageName}</span>
+            </h1>
+            <p className="page-description">{heading[1]}</p>
           </div>
           <button
             className="button quick-record"
-            onClick={() =>
-              setCapture({
-                target:
-                  page === "shopping"
-                    ? "shopping"
-                    : page === "items"
-                      ? "items"
-                      : page === "savings"
-                        ? "savings"
-                        : "ledger",
-                listId,
-              })
-            }
+            onClick={primaryAction.run}
           >
             <Plus size={18} />
-            快速记录
+            {primaryAction.label}
           </button>
         </header>
         {pending > 0 && page === "dashboard" && (
@@ -363,10 +732,44 @@ export default function Workspace() {
             refresh={refresh}
             dates={dates}
             setDates={setDates}
+            reminders={reminderData.reminders}
             openLedger={(id?: string | null) => {
               navigate("ledger");
               if (id !== undefined) setCategory(id || "none");
             }}
+          />
+        ) : page === "storage" ? (
+          <StoragePage
+            state={state}
+            mutate={mutate}
+            notify={setToast}
+            checkReminders={checkReminders}
+            openItem={(record: any, defaults: any, copy: boolean) =>
+              setItemEditor({ record, defaults, copy })
+            }
+            openAll={() => setAllItems(true)}
+          />
+        ) : page === "expiry" ? (
+          <ExpiryPage
+            state={state}
+            mutate={mutate}
+            notify={setToast}
+            checkReminders={checkReminders}
+            openItem={(record: any, defaults: any, copy: boolean) =>
+              setItemEditor({ record, defaults, copy })
+            }
+            openAll={() => setAllItems(true)}
+          />
+        ) : page === "reminders" ? (
+          <ReminderCenter
+            state={state}
+            data={reminderData}
+            check={checkReminders}
+            mutate={mutate}
+            notify={setToast}
+            openReminder={(rule?: any, target?: any) =>
+              setReminderEditor({ rule, target })
+            }
           />
         ) : page === "settings" ? (
           <SettingsPage
@@ -393,49 +796,70 @@ export default function Workspace() {
         ) : (
           <>
             {page === "savings" && (
-              <div className="saving-overview">
-                <Jar small />
-                <div>
-                  <small>当前日期范围 · 有效记录</small>
-                  <strong>
+              <CollapsibleSection
+                title="当前筛选已省"
+                summary={
+                  filterSummary
+                    ? `${filterSummary} · 有效记录`
+                    : "当前筛选范围 · 有效记录"
+                }
+                badge={
+                  <strong className="saving-fold-total">
                     ¥
                     {money(
-                      state.savings
-                        .filter(
-                          (s: any) =>
-                            effectiveSaving(s) &&
-                            s.date >= dates.start &&
-                            s.date <= dates.end,
-                        )
+                      records
+                        .filter((s: any) => effectiveSaving(s))
                         .reduce((a: number, s: any) => a + s.amount, 0),
                     )}
                   </strong>
-                  <span>是省下的决定，不是新增的收入。</span>
+                }
+                open={savingFold.open}
+                onToggle={savingFold.setOpen}
+                className="saving-fold"
+              >
+                <div className="saving-overview">
+                  <Jar small />
+                  <div>
+                    <small>当前筛选范围 · 有效记录</small>
+                    <strong>
+                      ¥
+                      {money(
+                        records
+                          .filter((s: any) => effectiveSaving(s))
+                          .reduce((a: number, s: any) => a + s.amount, 0),
+                      )}
+                    </strong>
+                    <span>是省下的决定，不是新增的收入。</span>
+                  </div>
+                  <div className="saving-mini-splits">
+                    {Object.entries(savingTypes).map(([key, label]) => (
+                      <div key={key}>
+                        <span>{label}</span>
+                        <b>
+                          ¥
+                          {money(
+                            records
+                              .filter(
+                                (s: any) =>
+                                  effectiveSaving(s) && s.type === key,
+                              )
+                              .reduce((a: number, s: any) => a + s.amount, 0),
+                          )}
+                        </b>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-                <div className="saving-mini-splits">
-                  {Object.entries(savingTypes).map(([key, label]) => (
-                    <div key={key}>
-                      <span>{label}</span>
-                      <b>
-                        ¥
-                        {money(
-                          state.savings
-                            .filter(
-                              (s: any) =>
-                                effectiveSaving(s) &&
-                                s.type === key &&
-                                s.date >= dates.start &&
-                                s.date <= dates.end,
-                            )
-                            .reduce((a: number, s: any) => a + s.amount, 0),
-                        )}
-                      </b>
-                    </div>
-                  ))}
-                </div>
-              </div>
+              </CollapsibleSection>
             )}
             {page === "shopping" && listId && (
+              <CollapsibleSection
+                title="清单说明与操作"
+                summary={list?.description || "复制、AI 补充建议"}
+                open={listContextFold.open}
+                onToggle={listContextFold.setOpen}
+                className="list-context-fold"
+              >
               <div className="list-context">
                 <button
                   className="text-button"
@@ -449,44 +873,78 @@ export default function Workspace() {
                 </button>
                 <ChevronRight size={16} />
                 <h2>{list?.name || "清单"}</h2>
+                <span className="pill">
+                  {(
+                    {
+                      shopping: "购物",
+                      travel: "出行",
+                      normal: "普通",
+                    } as Record<string, string>
+                  )[list?.kind || "shopping"]}
+                </span>
                 {list?.archived && <span className="pill">已归档</span>}
                 <p>{list?.description}</p>
-              </div>
-            )}
-            {page === "shopping" && list && (
-              <ListActions state={state} list={list} mutate={mutate} />
-            )}
-            {["ledger", "savings"].includes(page) && (
-              <div className="filter-bar">
                 <button
-                  className="button secondary"
-                  onClick={() => {
-                    setPageIndex(0);
-                    run(() =>
-                      mutate({
-                        action: "viewPreference",
-                        entity: page,
-                        mode: grouped ? "flat" : "grouped",
-                      }),
-                    );
-                  }}
+                  className="button secondary compact"
+                  onClick={() => setCopyListTarget(list)}
                 >
-                  {grouped ? "切换为平铺" : "切换为分组"}
+                  复制清单
                 </button>
-                <GroupControls
-                  state={state}
-                  entity={entity}
-                  selected={selectedRecords}
-                  mutate={mutate}
-                />
-                {fullGroup !== null && (
+                {!list?.archived && (
                   <button
-                    className="text-button"
-                    onClick={() => setFullGroup(null)}
+                    className="button secondary compact"
+                    onClick={() =>
+                      setCapture({
+                        target: "shopping",
+                        listId: list.id,
+                        initialText: "",
+                      })
+                    }
                   >
-                    返回筛选范围
+                    <Sparkles size={15} />
+                    AI 补充建议
                   </button>
                 )}
+              </div>
+              </CollapsibleSection>
+            )}
+            {page === "shopping" && list && list.kind === "shopping" && (
+              <CollapsibleSection
+                title="预算与结算"
+                summary={
+                  list.budget == null
+                    ? "未设置预算"
+                    : `总预算 ¥${money(list.budget)}`
+                }
+                open={listBudgetFold.open}
+                onToggle={listBudgetFold.setOpen}
+                className="list-budget-fold"
+              >
+                <ListActions state={state} list={list} mutate={mutate} />
+              </CollapsibleSection>
+            )}
+            {page === "shopping" && !listId && (
+              <div className="tabs list-kind-tabs" aria-label="清单类型">
+                {[
+                  ["all", "全部"],
+                  ["shopping", "购物"],
+                  ["travel", "出行"],
+                  ["normal", "普通"],
+                ].map(([value, label]) => (
+                  <button
+                    type="button"
+                    key={value}
+                    className={listKind === value ? "selected" : ""}
+                    aria-pressed={listKind === value}
+                    onClick={() => {
+                      setListKind(value);
+                      setSelection([]);
+                      setPageIndex(0);
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
             )}
             {["ledger", "items", "savings"].includes(page) && (
@@ -495,6 +953,8 @@ export default function Workspace() {
                 refresh={refresh}
                 notify={setToast}
                 target={page}
+                foldOpen={draftFold.open}
+                onFoldChange={draftFold.setOpen}
               />
             )}
             {page === "shopping" && (
@@ -504,8 +964,22 @@ export default function Workspace() {
                 notify={setToast}
                 target="shopping"
                 listId={listId}
+                foldOpen={draftFold.open}
+                onFoldChange={draftFold.setOpen}
               />
             )}
+            <CollapsibleSection
+              title="搜索与筛选"
+              icon={<Search size={15} aria-hidden="true" />}
+              summary={filterSummary}
+              badge={
+                filterConditions > 0 ? (
+                  <span className="fold-badge">已筛选 {filterConditions} 项</span>
+                ) : undefined
+              }
+              open={filterFold.open}
+              onToggle={filterFold.setOpen}
+            >
             <div className="filter-bar">
               <input
                 aria-label="搜索记录"
@@ -563,6 +1037,7 @@ export default function Workspace() {
                     onChange={(e) => {
                       setCategory(e.target.value);
                       setSelection([]);
+                      setPageIndex(0);
                     }}
                   >
                     <option value="all">
@@ -606,15 +1081,16 @@ export default function Workspace() {
                   )}
                 </>
               )}
-              {["ledger", "savings"].includes(page) && (
-                <a className="button secondary" href={`/api/export?${csvFilter}`} download>导出当前筛选 CSV</a>
-              )}
               {page === "savings" && (
                 <label className="check-field">
                   <input
                     type="checkbox"
                     checked={showArchived}
-                    onChange={(e) => setShowArchived(e.target.checked)}
+                    onChange={(e) => {
+                      setShowArchived(e.target.checked);
+                      setSelection([]);
+                      setPageIndex(0);
+                    }}
                   />
                   显示已撤销
                 </label>
@@ -624,48 +1100,44 @@ export default function Workspace() {
                   <input
                     type="checkbox"
                     checked={showArchived}
-                    onChange={(e) => setShowArchived(e.target.checked)}
+                    onChange={(e) => {
+                      setShowArchived(e.target.checked);
+                      setSelection([]);
+                      setPageIndex(0);
+                    }}
                   />
                   含已归档
                 </label>
               )}
-              <button
-                className="button secondary"
-                onClick={() =>
-                  setEditor({
-                    entity,
-                    record: entity === "shopping" ? { listId } : undefined,
-                  })
-                }
-              >
-                <Plus size={16} />
-                {entity === "lists" ? "新建清单" : "手动添加"}
-              </button>
-              {entity === "shopping" && !list?.archived && (
-                <button
-                  className="button"
-                  onClick={() => setCapture({ target: "shopping", listId })}
-                >
-                  <MicIcon />
-                  口述 / AI 添加
-                </button>
-              )}
             </div>
+            <div className="filter-footer">
+              <small>
+                {filterConditions
+                  ? `已筛选 ${filterConditions} 项 · ${records.length} 条结果`
+                  : `按当前条件展示 ${records.length} 条记录`}
+              </small>
+              <button
+                className="text-button"
+                onClick={() => {
+                  setQuery("");
+                  setType("all");
+                  setCategory("all");
+                  setAccount("all");
+                  setListKind("all");
+                  setShowArchived(false);
+                  setDates({
+                    start: `${localDate().slice(0, 7)}-01`,
+                    end: localDate(),
+                  });
+                  setSelection([]);
+                  setPageIndex(0);
+                }}
+              >
+                重置筛选
+              </button>
+            </div>
+            </CollapsibleSection>
             {bulkButton}
-            {["ledger", "shopping"].includes(entity) && (
-              <div className="section-tools">
-                <AiStatus ai={state.ai} />
-                <button
-                  className="button secondary"
-                  onClick={() => setClassification(true)}
-                >
-                  AI 分类
-                  {selection.length
-                    ? `（${selection.length} 条）`
-                    : "未分类记录"}
-                </button>
-              </div>
-            )}
             <div className="panel records-panel">
               <div className="record-header">
                 <label className="check-field">
@@ -694,7 +1166,155 @@ export default function Workspace() {
                   {grouped ? "全选当前已展开记录" : "全选当前页"}
                 </label>
                 <span>{records.length} 条记录</span>
+                <button
+                  type="button"
+                  className="text-button mobile-actions-toggle"
+                  aria-expanded={actionsFold.open}
+                  aria-controls={`record-actions-${filterKey}`}
+                  onClick={() => actionsFold.setOpen(!actionsFold.open)}
+                >
+                  <SlidersHorizontal size={14} />
+                  操作
+                </button>
               </div>
+              {["ledger", "savings", "shopping", "items"].includes(page) && (
+                <div className="record-actions">
+                  <div
+                    className={`record-actions-body ${actionsFold.open ? "open" : ""}`}
+                    id={`record-actions-${filterKey}`}
+                  >
+                  {["ledger", "savings"].includes(page) && (
+                    <>
+                      <button
+                        type="button"
+                        className="button secondary"
+                        onClick={() => {
+                          setPageIndex(0);
+                          run(() =>
+                            mutate({
+                              action: "viewPreference",
+                              entity: page,
+                              mode: grouped ? "flat" : "grouped",
+                            }),
+                          );
+                        }}
+                      >
+                        {grouped ? "切换为平铺" : "切换为分组"}
+                      </button>
+                      <GroupControls
+                        state={state}
+                        entity={entity}
+                        selected={selectedRecords}
+                        mutate={mutate}
+                        notify={setToast}
+                      />
+                    </>
+                  )}
+                  {page === "ledger" && (
+                    <button
+                      type="button"
+                      className="button secondary"
+                      onClick={() => setEditor({ entity: "ledger" })}
+                    >
+                      <Plus size={16} />
+                      手动添加
+                    </button>
+                  )}
+                  {page === "shopping" && !listId && (
+                    <button
+                      type="button"
+                      className="button secondary"
+                      onClick={() => setListWizard(true)}
+                    >
+                      <Sparkles size={16} />
+                      AI 帮我建清单
+                    </button>
+                  )}
+                  {page === "shopping" && listId && (
+                    <button
+                      type="button"
+                      className="button secondary"
+                      onClick={() =>
+                        setEditor({
+                          entity: "shopping",
+                          record: { listId },
+                        })
+                      }
+                    >
+                      <Plus size={16} />
+                      手动添加
+                    </button>
+                  )}
+                  {page === "items" && (
+                    <button
+                      type="button"
+                      className="button secondary"
+                      onClick={() =>
+                        setItemEditor({
+                          defaults: {
+                            costEnabled: true,
+                            storageEnabled: false,
+                          },
+                        })
+                      }
+                    >
+                      <Plus size={16} />
+                      登记成本物品
+                    </button>
+                  )}
+                  {page === "shopping" &&
+                    list?.kind === "shopping" &&
+                    !list?.archived && (
+                      <button
+                        type="button"
+                        className="button"
+                        onClick={() =>
+                          setCapture({ target: "shopping", listId })
+                        }
+                      >
+                        <MicIcon />
+                        口述 / AI 添加
+                      </button>
+                    )}
+                  {(entity === "ledger" ||
+                    (entity === "shopping" && list?.kind === "shopping")) && (
+                    <>
+                      <div className="record-actions-ai">
+                        <button
+                          type="button"
+                          className="button secondary"
+                          onClick={() => setClassification(true)}
+                        >
+                          AI 分类
+                          {selection.length
+                            ? `（${selection.length} 条）`
+                            : "未分类记录"}
+                        </button>
+                        <AiStatus ai={state.ai} compact />
+                      </div>
+                    </>
+                  )}
+                  {["ledger", "savings"].includes(page) && (
+                    <a
+                      className="button secondary"
+                      href={`/api/export?${csvFilter}`}
+                      download
+                    >
+                      导出当前筛选 CSV
+                    </a>
+                  )}
+                  {fullGroup !== null && (
+                    <button
+                      type="button"
+                      className="text-button"
+                      onClick={() => setFullGroup(null)}
+                    >
+                      返回筛选范围
+                    </button>
+                  )}
+                  </div>
+                </div>
+              )}
               {visible.length ? (
                 visible.map((record: any, index: number) => (
                   <Fragment key={record.id}>
@@ -714,7 +1334,21 @@ export default function Workspace() {
                           }}
                         />
                       )}
-                    <div className="record-row" key={record.id}>
+                    <div
+                      className="record-row"
+                      key={record.id}
+                      onClick={(event) => {
+                        if (layoutMode !== "mobile") return;
+                        const target = event.target as HTMLElement;
+                        if (
+                          target.closest(
+                            "input, button, a, .row-actions, .record-amount, .list-title",
+                          )
+                        )
+                          return;
+                        openRecordEditor(record);
+                      }}
+                    >
                       <input
                         aria-label={`选择${record.title || record.name}`}
                         type="checkbox"
@@ -732,7 +1366,16 @@ export default function Workspace() {
                         }}
                       />
                       <div className="row-actions">
+                        {entity === "shopping" && isShoppingRecord(record) && (
+                          <button
+                            className="text-button"
+                            onClick={() => setPurchaseReference(record)}
+                          >
+                            购买参考
+                          </button>
+                        )}
                         {entity === "shopping" &&
+                          isShoppingRecord(record) &&
                           ["considering", "planned"].includes(
                             record.status,
                           ) && (
@@ -764,6 +1407,7 @@ export default function Workspace() {
                             </>
                           )}
                         {entity === "shopping" &&
+                          isShoppingRecord(record) &&
                           record.status === "purchased" && (
                             <>
                               {record.ledgerId &&
@@ -809,6 +1453,7 @@ export default function Workspace() {
                             </>
                           )}
                         {entity === "shopping" &&
+                          isShoppingRecord(record) &&
                           record.status === "skipped" && (
                             <button
                               className="text-button"
@@ -825,6 +1470,67 @@ export default function Workspace() {
                               }
                             >
                               恢复待购
+                            </button>
+                          )}
+                        {entity === "shopping" &&
+                          !isShoppingRecord(record) && (
+                            <>
+                              <button
+                                className="button secondary compact"
+                                onClick={() =>
+                                  run(
+                                    async () => {
+                                      await mutate({
+                                        action: "save",
+                                        entity: "shopping",
+                                        id: record.id,
+                                        version: record.version,
+                                        data: { done: !record.done },
+                                      });
+                                      await checkReminders();
+                                    },
+                                    record.done ? "已恢复为未完成" : "已标记完成",
+                                  )
+                                }
+                              >
+                                {record.done ? "恢复未完成" : "标记完成"}
+                              </button>
+                              {state.lists.find(
+                                (row: any) => row.id === record.listId,
+                              )?.kind === "travel" && (
+                                <button
+                                  className="text-button"
+                                  onClick={() =>
+                                    setReminderEditor({
+                                      target: {
+                                        type: "listItem",
+                                        id: record.id,
+                                      },
+                                    })
+                                  }
+                                >
+                                  设提醒
+                                </button>
+                              )}
+                            </>
+                          )}
+                        {entity === "shopping" &&
+                          isShoppingRecord(record) &&
+                          ["considering", "planned"].includes(
+                            record.status,
+                          ) && (
+                            <button
+                              className="text-button"
+                              onClick={() =>
+                                setReminderEditor({
+                                  target: {
+                                    type: "shopping",
+                                    id: record.id,
+                                  },
+                                })
+                              }
+                            >
+                              设提醒
                             </button>
                           )}
                         {entity === "items" && (
@@ -852,6 +1558,27 @@ export default function Workspace() {
                               onClick={() => setUsageItem(record)}
                             >
                               使用记录
+                            </button>
+                            {record.expiryEnabled && record.expiresOn && (
+                              <button
+                                className="text-button"
+                                onClick={() =>
+                                  setReminderEditor({
+                                    target: { type: "item", id: record.id },
+                                  })
+                                }
+                              >
+                                设提醒
+                              </button>
+                            )}
+                            <button
+                              className="icon-button"
+                              aria-label="复制物品"
+                              onClick={() =>
+                                setItemEditor({ record, copy: true })
+                              }
+                            >
+                              <Copy size={16} />
                             </button>
                           </>
                         )}
@@ -900,14 +1627,18 @@ export default function Workspace() {
                           </button>
                         )}
                         <button
-                          className="icon-button"
+                          className="icon-button row-actions-primary"
                           aria-label="编辑"
-                          onClick={() => setEditor({ entity, record })}
+                          onClick={() => {
+                            if (entity === "items")
+                              setItemEditor({ record });
+                            else setEditor({ entity, record });
+                          }}
                         >
                           <Pencil size={16} />
                         </button>
                         <button
-                          className="icon-button"
+                          className="icon-button row-actions-primary"
                           aria-label="删除"
                           onClick={() => {
                             setSelection([record.id]);
@@ -944,13 +1675,40 @@ export default function Workspace() {
               ) : (
                 <Empty
                   title={
-                    query
+                    query || filterConditions
                       ? "没有找到匹配记录"
                       : entity === "lists"
                         ? "建一张自己的购物清单"
                         : "这一页还没有记录"
                   }
-                  text="可以手动添加，也可以把一段话交给 AI 整理。"
+                  text={
+                    query || filterConditions
+                      ? "换一个条件，或清除筛选后再看看。"
+                      : "可以手动添加，也可以把一段话交给 AI 整理。"
+                  }
+                  action={
+                    filterConditions ? (
+                      <button
+                        className="button secondary compact"
+                        onClick={() => {
+                          setQuery("");
+                          setType("all");
+                          setCategory("all");
+                          setAccount("all");
+                          setListKind("all");
+                          setShowArchived(false);
+                          setDates({
+                            start: `${localDate().slice(0, 7)}-01`,
+                            end: localDate(),
+                          });
+                          setSelection([]);
+                          setPageIndex(0);
+                        }}
+                      >
+                        清除筛选
+                      </button>
+                    ) : undefined
+                  }
                 />
               )}
               <div className="pagination">
@@ -1060,48 +1818,230 @@ export default function Workspace() {
           </>
         )}
       </main>
-      <nav className="mobile-nav">
-        {navigation.slice(0, 3).map((n) => (
-          <button
-            key={n.key}
-            className={page === n.key ? "active" : ""}
-            onClick={() => navigate(n.key)}
-          >
-            <n.icon size={20} />
-            {n.name}
-          </button>
-        ))}
-        <button className={more ? "active" : ""} onClick={() => setMore(!more)}>
+      <nav className="mobile-nav" aria-label="手机导航">
+        {layoutNavigation.main.map((key) => {
+          const entry = pageEntry(key);
+          if (!entry) return null;
+          const Icon = entry.icon;
+          return (
+            <button
+              key={key}
+              className={page === key ? "active" : ""}
+              onClick={() => navigate(key)}
+            >
+              <Icon size={20} />
+              {entry.name}
+            </button>
+          );
+        })}
+        <button
+          className={
+            more || layoutNavigation.more.includes(page as NavigationKey)
+              ? "active"
+              : ""
+          }
+          aria-haspopup="dialog"
+          aria-expanded={more}
+          onClick={() => setMore(true)}
+        >
           <MoreHorizontal size={22} />
           更多
         </button>
       </nav>
       {more && (
-        <div className="mobile-more">
-          {navigation.slice(3).map((n) => (
-            <button key={n.key} onClick={() => navigate(n.key)}>
-              <n.icon size={18} />
-              {n.name}
-            </button>
-          ))}
-          <button
-            onClick={() =>
-              run(async () => {
-                await api("auth/logout", {});
-                setState(null);
-              })
-            }
-          >
-            <LogOut size={18} />
-            退出登录
-          </button>
-        </div>
+        <Modal title="更多" close={() => setMore(false)} sheet>
+          <div className="mobile-more">
+            <div className="more-grid">
+              {layoutNavigation.more.map((key) => {
+                const entry = pageEntry(key);
+                if (!entry) return null;
+                const Icon = entry.icon;
+                return (
+                  <button
+                    key={key}
+                    className={page === key ? "active" : ""}
+                    onClick={() => navigate(key)}
+                  >
+                    <Icon size={18} />
+                    <span>{entry.name}</span>
+                    {key === "drafts" && pending > 0 && <em>{pending}</em>}
+                    {key === "reminders" &&
+                      reminderData.reminders.length > 0 && (
+                        <em>{reminderData.reminders.length}</em>
+                      )}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="more-utilities">
+              <button
+                className={page === "settings" ? "active" : ""}
+                onClick={() => navigate("settings")}
+              >
+                <Settings size={18} />
+                设置
+              </button>
+              <button
+                onClick={() => {
+                  setMore(false);
+                  setAssistantOpen(true);
+                }}
+              >
+                <Sparkles size={18} aria-hidden="true" />
+                小数管家
+              </button>
+              <button
+                onClick={() =>
+                  run(async () => {
+                    await api("auth/logout", {});
+                    setState(null);
+                  })
+                }
+              >
+                <LogOut size={18} />
+                退出登录
+              </button>
+            </div>
+          </div>
+        </Modal>
       )}
+      <Assistant
+        state={state}
+        page={page}
+        listId={listId}
+        list={list}
+        reminders={reminderData.reminders}
+        open={assistantOpen}
+        setOpen={setAssistantOpen}
+        onReference={openAssistantReference}
+        onCapture={openAssistantCapture}
+        onRefresh={refresh}
+      />
       {toast && (
         <div className="toast" role="status">
           <Check size={17} />
           {toast}
         </div>
+      )}
+      {itemEditor && (
+        <ItemEditor
+          record={itemEditor.record}
+          state={state}
+          defaults={itemEditor.defaults}
+          copy={itemEditor.copy}
+          close={() => setItemEditor(null)}
+          remove={
+            itemEditor.record?.id && !itemEditor.copy
+              ? async () => {
+                  await mutate({
+                    action: "batch",
+                    entity: "items",
+                    mode: "delete",
+                    records: [
+                      {
+                        id: itemEditor.record.id,
+                        version: itemEditor.record.version,
+                      },
+                    ],
+                  });
+                  setToast("物品已删除，账单和其他用途记录不受影响");
+                  await checkReminders();
+                }
+              : undefined
+          }
+          save={async (data: any, reminder: any) => {
+            const saved = await mutate({
+              action: "save",
+              entity: "items",
+              id: itemEditor.record?.id,
+              version: itemEditor.record?.version,
+              data,
+            });
+            if (reminder && data.expiryEnabled && data.expiresOn) {
+              await mutate({
+                action: "reminderSave",
+                targetType: "item",
+                targetId: saved.id,
+                triggerType: "relative",
+                offsetDays: reminder.offsetDays,
+                localTime: reminder.localTime,
+                timezone: state.user.timezone,
+              });
+            }
+            setToast("物品已保存");
+            await checkReminders();
+          }}
+        />
+      )}
+      {allItems && (
+        <AllItemsModal
+          state={state}
+          close={() => setAllItems(false)}
+          openItem={(record: any) => setItemEditor({ record })}
+        />
+      )}
+      {purchaseReference && (
+        <PurchaseReferenceModal
+          state={state}
+          item={purchaseReference}
+          close={() => setPurchaseReference(null)}
+          onReference={(reference: any) => {
+            setPurchaseReference(null);
+            openAssistantReference(reference);
+          }}
+        />
+      )}
+      {copyListTarget && (
+        <CopyListModal
+          list={copyListTarget}
+          close={() => setCopyListTarget(null)}
+          save={async (data: any) => {
+            const copy = await mutate({
+              action: "copyList",
+              id: copyListTarget.id,
+              version: copyListTarget.version,
+              ...data,
+            });
+            setListId(copy.id);
+            setPageIndex(0);
+            setToast("已复制清单，请核对内容");
+          }}
+        />
+      )}
+      {listWizard && (
+        <AiListWizard
+          close={() => setListWizard(false)}
+          save={async (data: any) => {
+            const { prompt, ...listData } = data;
+            const saved = await mutate({
+              action: "save",
+              entity: "lists",
+              data: listData,
+            });
+            setListId(saved.id);
+            setPageIndex(0);
+            setToast("清单已创建，确认 AI 建议后才会写入条目");
+            if (prompt)
+              setCapture({
+                target: "shopping",
+                listId: saved.id,
+                initialText: prompt,
+              });
+          }}
+        />
+      )}
+      {reminderEditor && (
+        <ReminderEditor
+          state={state}
+          rule={reminderEditor.rule}
+          target={reminderEditor.target}
+          close={() => setReminderEditor(null)}
+          save={async (data: any) => {
+            await mutate({ action: "reminderSave", ...data });
+            setToast("提醒已保存");
+            await checkReminders();
+          }}
+        />
       )}
       {editor && (
         <Editor
@@ -1117,6 +2057,8 @@ export default function Workspace() {
               version: editor.record?.version,
               data,
             });
+            if (["lists", "shopping"].includes(editor.entity))
+              await checkReminders();
             setToast("已保存");
           }}
         />
@@ -1176,6 +2118,7 @@ export default function Workspace() {
               ...data,
             });
             setToast("购物决定已记录");
+            await checkReminders();
           }}
         />
       )}
@@ -1208,6 +2151,7 @@ export default function Workspace() {
               ...data,
             });
             setToast("补记账完成");
+            await checkReminders();
           }}
         />
       )}
@@ -1224,12 +2168,14 @@ export default function Workspace() {
               ...data,
             });
             setToast("已撤销购买，物品回到待购买");
+            await checkReminders();
           }}
         />
       )}
       {reviewItem && (
         <CreateReview
           item={reviewItem}
+          state={state}
           close={() => setReviewItem(null)}
           save={async (data: any) => {
             await mutate({
@@ -1270,6 +2216,245 @@ export default function Workspace() {
 
 function MicIcon() {
   return <Sparkles size={16} />;
+}
+function AiListWizard({ close, save }: any) {
+  const [data, setData] = useState({
+      name: "",
+      kind: "travel",
+      departureDate: "",
+      description: "",
+      prompt: "",
+    }),
+    [error, setError] = useState(""),
+    [busy, setBusy] = useState(false);
+  const kindCopy: Record<string, string> = {
+    travel: "出行准备会按证件、衣物、防晒、洗漱等分组，不产生预算或账单。",
+    normal: "普通清单适合家务、搬家或日常安排，不会关联库存或消费。",
+    shopping: "购物清单保留预算和分类；AI 只给候选，确认后才写入。",
+  };
+  return (
+    <Modal title="AI 帮我建清单" close={close}>
+      <p className="hint">
+        先说清用途和场景。下一步会打开这份清单的建议整理，候选由你逐条确认，不会直接新增条目。
+      </p>
+      <div className="form-grid">
+        <FieldInput
+          field={{ key: "name", label: "清单名称", required: true }}
+          value={data.name}
+          set={(value) => setData({ ...data, name: value })}
+        />
+        <FieldInput
+          field={{
+            key: "kind",
+            label: "用途",
+            type: "select",
+            options: [
+              { value: "travel", label: "出行清单" },
+              { value: "normal", label: "普通清单" },
+              { value: "shopping", label: "购物清单" },
+            ],
+          }}
+          value={data.kind}
+          set={(value) => setData({ ...data, kind: value })}
+        />
+        {data.kind === "travel" && (
+          <FieldInput
+            field={{ key: "departureDate", label: "出发日期", type: "date" }}
+            value={data.departureDate}
+            set={(value) => setData({ ...data, departureDate: value })}
+          />
+        )}
+        <FieldInput
+          field={{ key: "description", label: "说明", type: "textarea" }}
+          value={data.description}
+          set={(value) => setData({ ...data, description: value })}
+        />
+      </div>
+      <label className="field">
+        <span>想准备什么</span>
+        <textarea
+          rows={4}
+          value={data.prompt}
+          onChange={(event) =>
+            setData({ ...data, prompt: event.target.value })
+          }
+          placeholder={
+            data.kind === "travel"
+              ? "两大一小，海边三天，想轻装，防晒和常用药别忘了……"
+              : data.kind === "normal"
+                ? "周末大扫除，按房间列一下要准备的工具……"
+                : "这周想补牛奶、鸡蛋和洗衣液，洗衣液要无香的……"
+          }
+        />
+        <small className="hint">{kindCopy[data.kind]}</small>
+      </label>
+      {error && <p className="error">{error}</p>}
+      <footer>
+        <button className="button secondary" onClick={close}>
+          取消
+        </button>
+        <button
+          className="button"
+          disabled={busy || !data.name.trim()}
+          onClick={async () => {
+            setBusy(true);
+            setError("");
+            try {
+              await save({
+                name: data.name.trim(),
+                kind: data.kind,
+                description: data.description,
+                departureDate:
+                  data.kind === "travel" ? data.departureDate || null : null,
+                prompt: data.prompt.trim(),
+              });
+              close();
+            } catch (cause) {
+              setError((cause as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          {busy ? <Busy /> : "创建并开始建议"}
+        </button>
+      </footer>
+    </Modal>
+  );
+}
+function CopyListModal({ list, close, save }: any) {
+  const [resetDone, setResetDone] = useState(true);
+  const [departureDate, setDepartureDate] = useState(
+    list.departureDate || "",
+  );
+  const [error, setError] = useState(""),
+    [busy, setBusy] = useState(false);
+  return (
+    <Modal title={`复制 · ${list.name}`} close={close}>
+      <p className="hint">
+        新清单独立保存。购物清单不会复制实付、账单、物品关联、结算、评议和省钱记录。
+      </p>
+      <label className="check-field">
+        <input
+          type="checkbox"
+          checked={resetDone}
+          onChange={(e) => setResetDone(e.target.checked)}
+        />
+        重置完成状态
+      </label>
+      {list.kind === "travel" && (
+        <FieldInput
+          field={{
+            key: "departureDate",
+            label: "新出发日期",
+            type: "date",
+            hint: "复制后请核对出发日期；提醒不会自动复制。",
+          }}
+          value={departureDate}
+          set={setDepartureDate}
+        />
+      )}
+      {error && <p className="error">{error}</p>}
+      <footer>
+        <button className="button secondary" onClick={close}>
+          取消
+        </button>
+        <button
+          className="button"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            setError("");
+            try {
+              await save({
+                resetDone,
+                ...(list.kind === "travel"
+                  ? { departureDate: departureDate || null }
+                  : {}),
+              });
+              close();
+            } catch (e) {
+              setError((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          {busy ? <Busy /> : "创建副本"}
+        </button>
+      </footer>
+    </Modal>
+  );
+}
+
+function PurchaseReferenceModal({ state, item, close, onReference }: any) {
+  const timezone = state.user.timezone || "Asia/Shanghai";
+  const list = state.lists.find((row: any) => row.id === item.listId);
+  const answer = answerAssistant(`上次${item.name}多少钱？`, state, {
+    page: "shopping",
+    listId: item.listId,
+    listName: list?.name || null,
+    today: localDate(new Date(), timezone),
+    timezone,
+    reminders: [],
+  });
+  return (
+    <Modal title="购买参考" wide close={close}>
+      <article className="purchase-reference">
+        <h3>{answer.title}</h3>
+        <p>{answer.body}</p>
+        {answer.facts?.length ? (
+          <div className="assistant-facts">
+            {answer.facts.map((fact: any) => (
+              <div
+                className="assistant-fact"
+                key={`${fact.label}:${fact.value}`}
+              >
+                <small>{fact.label}</small>
+                <strong>{fact.value}</strong>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {answer.rows?.length ? (
+          <div className="assistant-rows">
+            {answer.rows.map((row: any) =>
+              row.reference ? (
+                <button
+                  className="assistant-row is-link"
+                  key={row.id}
+                  onClick={() => onReference(row.reference)}
+                >
+                  <span className="assistant-row-copy">
+                    <b>{row.title}</b>
+                    <small>{row.meta}</small>
+                    {row.detail && <em>{row.detail}</em>}
+                  </span>
+                  <ChevronRight size={15} aria-hidden="true" />
+                </button>
+              ) : (
+                <div className="assistant-row" key={row.id}>
+                  <span className="assistant-row-copy">
+                    <b>{row.title}</b>
+                    <small>{row.meta}</small>
+                    {row.detail && <em>{row.detail}</em>}
+                  </span>
+                </div>
+              ),
+            )}
+          </div>
+        ) : null}
+        {answer.caution && (
+          <p className="assistant-caution">{answer.caution}</p>
+        )}
+      </article>
+      <footer>
+        <button className="button secondary" onClick={close}>
+          关闭
+        </button>
+      </footer>
+    </Modal>
+  );
 }
 function ResolveSaving({ record, close, save }: any) {
   const [amount, setAmount] = useState(record.amount),
@@ -1360,10 +2545,23 @@ function RecordBody({ entity, record: r, state, openList }: any) {
         <button className="record-content list-title" onClick={openList}>
           <b>
             {r.name}
+            <span className="pill">
+              {(
+                {
+                  shopping: "购物",
+                  travel: "出行",
+                  normal: "普通",
+                } as Record<string, string>
+              )[r.kind || "shopping"]}
+            </span>
             {r.archived && <span className="pill">已归档</span>}
           </b>
           <small>
-            {state.shopping.filter((s: any) => s.listId === r.id).length} 件物品
+            {state.shopping.filter((s: any) => s.listId === r.id).length}{" "}
+            {r.kind === "shopping" || !r.kind ? "件物品" : "个条目"}
+            {r.kind === "travel" && r.departureDate
+              ? ` · 出发 ${r.departureDate}`
+              : ""}
             {r.description && ` · ${r.description}`}
           </small>
         </button>
@@ -1377,6 +2575,37 @@ function RecordBody({ entity, record: r, state, openList }: any) {
       </>
     );
   if (entity === "shopping") {
+    const list = state.lists.find((row: any) => row.id === r.listId);
+    if (list && list.kind !== "shopping") {
+      return (
+        <>
+          <span className="entry-symbol">
+            {list.kind === "travel" ? (
+              <Plane size={19} />
+            ) : (
+              <Check size={19} />
+            )}
+          </span>
+          <div className="record-content">
+            <b>
+              {r.name}
+              <span className={`pill ${r.done ? "yellow" : ""}`}>
+                {r.done ? "已完成" : "待准备"}
+              </span>
+              {r.groupName && <span className="pill">{r.groupName}</span>}
+            </b>
+            <small>
+              {r.quantity ? `${r.quantity} · ` : ""}
+              {r.note || "还没有备注"}
+            </small>
+          </div>
+          <div className="record-amount">
+            <strong>{r.done ? "已勾选" : "准备中"}</strong>
+            <small>{list.kind === "travel" ? "出行准备" : "普通清单"}</small>
+          </div>
+        </>
+      );
+    }
     const category = state.categories.find((c: any) => c.id === r.categoryId);
     const hasLedger =
       !!r.ledgerId &&
@@ -1444,11 +2673,10 @@ function RecordBody({ entity, record: r, state, openList }: any) {
           .filter((e: any) => e.refundOfId === ledger.id)
           .reduce((s: number, e: any) => s + e.amount, 0)
       : 0;
-    const net = (ledger?.amount ?? r.price) - refunds - r.recovery;
-    const days = heldDays(r.purchaseDate, r.retiredDate);
     const count = state.usage
       .filter((u: any) => u.itemId === r.id)
       .reduce((s: number, u: any) => s + u.count, 0);
+    const view = itemCostView(r, { ledger, refunds, usageCount: count });
     return (
       <>
         <span className="entry-symbol">
@@ -1457,28 +2685,42 @@ function RecordBody({ entity, record: r, state, openList }: any) {
         <div className="record-content">
           <b>
             {r.name}
-            <span className="pill">{r.retiredDate ? "已退役" : "使用中"}</span>
+            <span className="pill">
+              {r.retiredDate
+                ? "已退役"
+                : r.status === "used"
+                  ? "已用完"
+                  : r.status === "discarded"
+                    ? "已丢弃"
+                    : r.status === "archived"
+                      ? "已归档"
+                      : "使用中"}
+            </span>
           </b>
           <small>
-            {r.purchaseDate} 购入 · 陪伴 {days} 天 · 使用 {count} 次
+            {r.purchaseDate
+              ? `${r.purchaseDate} 购入 · 陪伴 ${heldDays(r.purchaseDate, r.retiredDate)} 天`
+              : "未登记购入信息"}
+            {" · "}使用 {count} 次
+          </small>
+          <small>
+            {r.quantity ?? 1} {r.unit || "件"}
+            {r.location ? ` · ${r.location}` : ""}
+            {r.expiresOn ? ` · ${r.expiresOn} 到期` : ""}
           </small>
           {r.note && <small>{r.note}</small>}
         </div>
         <div className="record-amount">
           <strong>
-            {r.mode === "use"
-              ? count
-                ? `¥${money(net / count)}`
-                : "还没开始使用"
-              : `¥${money(net / days)}`}
-            <small>{r.mode === "use" ? (count ? "/次" : "") : "/天"}</small>
+            {view.value == null ? view.label : `¥${money(view.value)}`}
+            {view.value != null && <small>{view.unit}</small>}
           </strong>
           <small>
-            {r.mode === "use"
-              ? `¥${money(net / days)}/天`
-              : count
-                ? `¥${money(net / count)}/次`
-                : "还没开始使用"}
+            {view.secondary
+              ? view.secondary.value == null
+                ? view.secondary.label
+                : `另：¥${money(view.secondary.value)}${view.secondary.unit}`
+              : view.label}
           </small>
         </div>
       </>
@@ -1525,13 +2767,21 @@ function Auth({ done, error: initialError }: any) {
   const [registerMode, setRegisterMode] = useState(false),
     [username, setUsername] = useState(""),
     [password, setPassword] = useState(""),
+    [inviteCode, setInviteCode] = useState(""),
+    [showPassword, setShowPassword] = useState(false),
     [busy, setBusy] = useState(false),
     [error, setError] = useState(initialError || "");
   return (
     <main className="auth-page">
       <section className="auth-intro">
-        <span className="brand">
-          <BookOpen size={28} /> UCost
+        <span className="brand auth-brand">
+          <span className="brand-mark">
+            <BookOpen size={20} aria-hidden="true" />
+          </span>
+          <span>
+            UCost
+            <small>日常有数</small>
+          </span>
         </span>
         <h1>
           把生活的账，
@@ -1539,20 +2789,26 @@ function Auth({ done, error: initialError }: any) {
           轻轻记下来。
         </h1>
         <p>
-          花了多少，想买什么，
-          <br />
-          还有那些悄悄省下来的钱。
+          花了多少，想买什么，还有那些悄悄省下来的钱。每天几分钟，给日子留一页清楚的底稿。
         </p>
-        <Jar />
-        <span className="hand-note">日常有数，心里有底。</span>
+        <div className="auth-jar-stage">
+          <Jar />
+          <span className="hand-note">日常有数，心里有底。</span>
+        </div>
       </section>
       <section className="auth-form panel">
-        <h2>{registerMode ? "翻开你的第一本账" : "欢迎回来"}</h2>
-        <p>
-          {registerMode
-            ? "创建本地账号，数据保存在这台电脑的 SQLite 中。"
-            : "登录，接着记下今天的生活。"}
-        </p>
+        <span className="auth-form-stamp" aria-hidden="true">
+          UC
+          <small>账本</small>
+        </span>
+        <header className="auth-form-head">
+          <h2>{registerMode ? "翻开你的第一本账" : "欢迎回来"}</h2>
+          <p>
+            {registerMode
+              ? "创建账号，开始记录日常收支。"
+              : "登录，接着记下今天的生活。"}
+          </p>
+        </header>
         <form
           onSubmit={async (e) => {
             e.preventDefault();
@@ -1562,6 +2818,7 @@ function Auth({ done, error: initialError }: any) {
               await api(`auth/${registerMode ? "register" : "login"}`, {
                 username,
                 password,
+                ...(registerMode ? { inviteCode } : {}),
               });
               await done();
             } catch (err) {
@@ -1571,42 +2828,100 @@ function Auth({ done, error: initialError }: any) {
             }
           }}
         >
-          <label className="field">
-            <span>用户名</span>
-            <input
-              autoComplete="username"
-              value={username}
-              required
-              minLength={2}
-              onChange={(e) => setUsername(e.target.value)}
-            />
-          </label>
-          <label className="field">
-            <span>密码</span>
-            <input
-              type="password"
-              autoComplete={registerMode ? "new-password" : "current-password"}
-              minLength={8}
-              value={password}
-              required
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </label>
-          {error && <p className="error">{error}</p>}
-          <button className="button" disabled={busy}>
-            {busy ? <Busy /> : registerMode ? "创建账号" : "登录账本"}
+          <div className="auth-field">
+            <label htmlFor="auth-username">用户名</label>
+            <div className="auth-input">
+              <UserRound size={16} aria-hidden="true" />
+              <input
+                id="auth-username"
+                autoComplete="username"
+                value={username}
+                required
+                minLength={2}
+                maxLength={40}
+                onChange={(e) => setUsername(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="auth-field">
+            <label htmlFor="auth-password">密码</label>
+            <div className="auth-input">
+              <KeyRound size={16} aria-hidden="true" />
+              <input
+                id="auth-password"
+                type={showPassword ? "text" : "password"}
+                autoComplete={
+                  registerMode ? "new-password" : "current-password"
+                }
+                minLength={8}
+                maxLength={100}
+                value={password}
+                required
+                onChange={(e) => setPassword(e.target.value)}
+              />
+              <button
+                type="button"
+                className="auth-eye"
+                aria-label={showPassword ? "隐藏密码" : "显示密码"}
+                onClick={() => setShowPassword(!showPassword)}
+              >
+                {showPassword ? (
+                  <EyeOff size={16} aria-hidden="true" />
+                ) : (
+                  <Eye size={16} aria-hidden="true" />
+                )}
+              </button>
+            </div>
+          </div>
+          {registerMode && (
+            <div className={`auth-invite ${inviteCode.trim() ? "filled" : ""}`}>
+              <div className="auth-invite-head">
+                <span>
+                  <Ticket size={15} aria-hidden="true" />
+                  邀请码
+                </span>
+                <small>{inviteCode.trim() ? "已填写" : "可选"}</small>
+              </div>
+              <input
+                id="auth-invite"
+                aria-label="邀请码（可选）"
+                placeholder="请输入邀请码"
+                autoComplete="off"
+                autoCapitalize="characters"
+                spellCheck={false}
+                maxLength={40}
+                value={inviteCode}
+                onChange={(e) => setInviteCode(e.target.value.toUpperCase())}
+              />
+              <p>填写有效邀请码才能使用 AI，系统 AI 不限使用次数。</p>
+            </div>
+          )}
+          {error && (
+            <p className="error auth-error" role="alert">
+              {error}
+            </p>
+          )}
+          <button className="button auth-submit" disabled={busy}>
+            {busy ? (
+              <Busy />
+            ) : (
+              <>
+                {registerMode ? "创建账号" : "登录账本"}
+                <ArrowRight size={16} aria-hidden="true" />
+              </>
+            )}
           </button>
         </form>
         <button
-          className="text-button"
+          className="text-button auth-switch"
           onClick={() => {
             setRegisterMode(!registerMode);
             setError("");
+            setShowPassword(false);
           }}
         >
           {registerMode ? "已有账号，去登录" : "第一次来？创建账号"}
         </button>
-        <small>不连接银行，不需要付费数据库。</small>
       </section>
     </main>
   );
@@ -1628,6 +2943,8 @@ function BatchEditor({ entity, records, state, save, close }: any) {
       "categoryId",
       "note",
       "status",
+      "groupName",
+      "done",
     ],
     savings: ["title", "date", "planned", "actual", "amount", "type", "note"],
     items: ["name", "note", "retiredDate"],
@@ -1829,6 +3146,9 @@ function BatchEditor({ entity, records, state, save, close }: any) {
 
 function Convert({ item, state, save, close }: any) {
   const skip = item.mode === "skip";
+  const quantitySuggestion = /^(\d+)\s*(.*)$/.exec(
+    String(item.quantity || "").trim(),
+  );
   const defaultAccount =
     item.purchaseAccountId ||
     (state.accounts.some(
@@ -1847,6 +3167,14 @@ function Convert({ item, state, save, close }: any) {
       createLedger: !skip,
       createItem: false,
       createSaving: skip,
+      registerStorage: false,
+      registerExpiry: false,
+      expiresOn: "",
+      location: "",
+      registerQuantity: quantitySuggestion
+        ? Number(quantitySuggestion[1])
+        : 1,
+      registerUnit: quantitySuggestion?.[2] || "件",
       accountId: defaultAccount,
       categoryId: item.categoryId || "",
     }),
@@ -1855,6 +3183,19 @@ function Convert({ item, state, save, close }: any) {
   const set = (key: string, v: any) => setData({ ...data, [key]: v });
   return (
     <Modal title={`${skip ? "不买了" : "买到了"} · ${item.name}`} close={close}>
+      <div className="purchase-summary">
+        <span>
+          数量
+          <b>{item.quantity || "未填写"}</b>
+        </span>
+        <span>
+          预计总预算
+          <b>{item.budget == null ? "未设置" : `¥${money(item.budget)}`}</b>
+        </span>
+        <small>
+          实际付款填本次全部数量的合计金额，不按数量乘预算。
+        </small>
+      </div>
       <div className="form-grid">
         <FieldInput
           field={{ key: "date", label: "日期", type: "date" }}
@@ -1864,7 +3205,12 @@ function Convert({ item, state, save, close }: any) {
         {!skip && (
           <>
             <FieldInput
-              field={{ key: "paid", label: "实际付款（元）", type: "money" }}
+              field={{
+                key: "paid",
+                label: "实际付款（全部数量合计，元）",
+                type: "money",
+                hint: "零元获得请填 0，不会自动生成支出。",
+              }}
               value={data.paid}
               set={(v) => set("paid", v)}
             />
@@ -1946,8 +3292,69 @@ function Convert({ item, state, save, close }: any) {
               checked={data.createItem}
               onChange={(e) => set("createItem", e.target.checked)}
             />
-            建立物品档案
+            同时计算物品成本（以本次实付作为购入金额）
           </label>
+          <div className="registration-box">
+            <b>顺手登记到生活管家</b>
+            <p className="hint">
+              只保存来源说明，不把账单金额分摊给物品，也不自动建立成本关联。
+            </p>
+            <label className="check-field">
+              <input
+                type="checkbox"
+                checked={data.registerStorage}
+                onChange={(e) => set("registerStorage", e.target.checked)}
+              />
+              登记收纳位置
+            </label>
+            {data.registerStorage && (
+              <FieldInput
+                field={{
+                  key: "location",
+                  label: "放在哪里",
+                  hint: "例如：厨房 / 上层柜",
+                }}
+                value={data.location}
+                set={(v) => set("location", v)}
+              />
+            )}
+            {(data.registerStorage || data.registerExpiry) && (
+              <div className="quantity-field">
+                <FieldInput
+                  field={{
+                    key: "registerQuantity",
+                    label: "登记数量",
+                    type: "number",
+                    hint: quantitySuggestion
+                      ? "已从清单数量带入，请核对。"
+                      : "清单数量不是精确数字，请确认。",
+                  }}
+                  value={data.registerQuantity}
+                  set={(v) => set("registerQuantity", v ?? 1)}
+                />
+                <FieldInput
+                  field={{ key: "registerUnit", label: "单位" }}
+                  value={data.registerUnit}
+                  set={(v) => set("registerUnit", v)}
+                />
+              </div>
+            )}
+            <label className="check-field">
+              <input
+                type="checkbox"
+                checked={data.registerExpiry}
+                onChange={(e) => set("registerExpiry", e.target.checked)}
+              />
+              登记保质期
+            </label>
+            {data.registerExpiry && (
+              <FieldInput
+                field={{ key: "expiresOn", label: "到期日", type: "date" }}
+                value={data.expiresOn}
+                set={(v) => set("expiresOn", v)}
+              />
+            )}
+          </div>
         </>
       )}
       <label className="check-field">
@@ -1961,7 +3368,9 @@ function Convert({ item, state, save, close }: any) {
       <div className="preview-note">
         {skip
           ? `不新增支出${data.createSaving ? `，省下 ¥${money(data.planned || 0)}` : ""}`
-          : `实际支出 ¥${money(data.paid || 0)}；优惠 ¥${money(data.discount || 0)}${data.createSaving ? `；降级差额 ¥${money((data.planned || 0) - (data.paid || 0) - (data.discount || 0))}` : ""}`}
+          : data.paid === 0
+            ? "零元获得，不新增支出。"
+            : `实际支出 ¥${money(data.paid || 0)}；优惠 ¥${money(data.discount || 0)}${data.createSaving ? `；降级差额 ¥${money((data.planned || 0) - (data.paid || 0) - (data.discount || 0))}` : ""}`}
       </div>
       {error && <p className="error">{error}</p>}
       <footer>
@@ -1973,7 +3382,20 @@ function Convert({ item, state, save, close }: any) {
           disabled={busy}
           onClick={async () => {
             setBusy(true);
+            setError("");
             try {
+              if (!skip && (data.paid === null || data.paid === undefined)) {
+                setError("请填写本次全部数量的实际付款；零元获得请填 0");
+                return;
+              }
+              if (data.createSaving && !data.planned) {
+                setError("记录省钱需要填写原计划金额");
+                return;
+              }
+              if (data.registerExpiry && !data.expiresOn) {
+                setError("登记保质期需要填写到期日");
+                return;
+              }
               await save(data);
               close();
             } catch (e) {
@@ -2377,7 +3799,8 @@ function PurchaseUndo({ item, state, save, close }: any) {
   );
 }
 
-function CreateReview({ item, save, close }: any) {
+function CreateReview({ item, state, save, close }: any) {
+  const aiAllowed = !!state.ai?.allowed;
   const [data, setData] = useState({
       title: `帮我看看：${item.name}`,
       description: "",
@@ -2446,7 +3869,7 @@ function CreateReview({ item, save, close }: any) {
       </div>
       <button
         className="text-button"
-        disabled={busy || !data.description}
+        disabled={busy || !data.description || !aiAllowed}
         onClick={async () => {
           setBusy(true);
           try {
@@ -2553,7 +3976,9 @@ function SettingsPage({ state, mutate, edit, notify, refresh }: any) {
     [error, setError] = useState("");
   return (
     <div className="settings-grid">
+      <NavigationSettings state={state} mutate={mutate} notify={notify} />
       <PersonalAi state={state} refresh={refresh} />
+      <InviteCodePanel state={state} mutate={mutate} notify={notify} />
       <section className="panel">
         <div className="panel-heading">
           <h2>账户</h2>
@@ -2649,7 +4074,9 @@ function SettingsPage({ state, mutate, edit, notify, refresh }: any) {
         <p className="hint">
           {state.ai.configured
             ? "AI 服务已就绪"
-            : "AI 服务暂不可用，可继续暂存与手动整理"}
+            : state.ai.allowed
+              ? "AI 服务暂不可用，可继续暂存与手动整理"
+              : "未绑定邀请码，暂不能使用 AI；可先手动记账、暂存与导入导出"}
         </p>
         <label className="check-field">
           <input
@@ -2690,7 +4117,7 @@ function SettingsPage({ state, mutate, edit, notify, refresh }: any) {
           </button>
           <button
             className="button secondary"
-            disabled={busy}
+            disabled={busy || !state.ai.allowed}
             onClick={async () => {
               setBusy(true);
               try {
@@ -2713,5 +4140,93 @@ function SettingsPage({ state, mutate, edit, notify, refresh }: any) {
       </section>
       <ExchangePanel state={state} refresh={refresh} />
     </div>
+  );
+}
+
+function InviteCodePanel({ state, mutate, notify }: any) {
+  const bound = !!state.ai?.inviteCode;
+  const [code, setCode] = useState(""),
+    [busy, setBusy] = useState(false),
+    [error, setError] = useState("");
+  return (
+    <section className="panel invite-panel">
+      <div className="panel-heading">
+        <h2>邀请码</h2>
+        <span className={`invite-status ${bound ? "active" : ""}`}>
+          <i aria-hidden="true" />
+          {bound ? "已生效" : "未绑定"}
+        </span>
+      </div>
+      {bound ? (
+        <div className="invite-bound">
+          <span className="invite-bound-icon" aria-hidden="true">
+            <TicketCheck size={20} />
+          </span>
+          <div className="invite-bound-copy">
+            <small>已绑定邀请码</small>
+            <strong>{state.ai.inviteCode}</strong>
+            <p className="hint">系统 AI 不限使用次数，无需再填写。</p>
+          </div>
+          <span className="invite-bound-check" aria-hidden="true">
+            <Check size={16} />
+          </span>
+        </div>
+      ) : (
+        <form
+          className="invite-form"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            if (!code.trim() || busy) return;
+            setBusy(true);
+            setError("");
+            try {
+              await mutate({ action: "redeemInvite", code: code.trim() });
+              setCode("");
+              notify("邀请码已绑定");
+            } catch (e) {
+              setError((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <p className="hint">
+            未绑定邀请码暂不能使用 AI；已经注册的账号可以补填邀请码，绑定后即可使用且不限次数。
+          </p>
+          <div className={`invite-ticket ${code.trim() ? "filled" : ""}`}>
+            <div className="invite-ticket-head">
+              <label htmlFor="settings-invite-code">
+                <Ticket size={15} aria-hidden="true" />
+                邀请码
+              </label>
+              <small>{code.trim() ? "待绑定" : "选填"}</small>
+            </div>
+            <input
+              id="settings-invite-code"
+              autoComplete="off"
+              autoCapitalize="characters"
+              spellCheck={false}
+              maxLength={40}
+              value={code}
+              onChange={(e) => setCode(e.target.value.toUpperCase())}
+              aria-describedby="settings-invite-hint"
+            />
+          </div>
+          <div className="invite-actions">
+            <button className="button" disabled={busy || !code.trim()}>
+              {busy ? <Busy /> : "绑定邀请码"}
+            </button>
+            <small className="hint" id="settings-invite-hint">
+              绑定后不能更换，请核对后提交。
+            </small>
+          </div>
+          {error && (
+            <p className="error" role="alert">
+              {error}
+            </p>
+          )}
+        </form>
+      )}
+    </section>
   );
 }

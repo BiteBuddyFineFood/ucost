@@ -362,8 +362,8 @@ export function ExchangePanel({ state, refresh }: any) {
       )}
       <p className="hint">
         不导出密码、会话、AI 密钥或有效分享链接。JSON
-        不含附件文件，导入后显示“附件未迁移”。完整备份需保存数据库及
-        uploads，恢复步骤见 README。
+        不含附件文件，导入后显示“附件未迁移”。完整恢复使用 D1 数据库导出，步骤见 README。旧 uploads 文件仍保留在原电脑，当前版本不再存储截图。
+        单个导入文件最多 500KB、300 条，超限会在写入前拒绝。
       </p>
     </section>
   );

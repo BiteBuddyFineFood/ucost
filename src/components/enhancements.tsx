@@ -1,132 +1,182 @@
 "use client";
 import { useEffect, useState } from "react";
+import { ChevronDown } from "lucide-react";
 import { api, Modal, Busy } from "./ui";
 import { cents, money, localDate, effectiveSaving, totals } from "@/lib/domain";
 
-export function AiStatus({ ai }: any) {
+export function AiStatus({ ai, compact = false }: any) {
+  const allowed = ai?.allowed === true;
+  const usage = !allowed
+    ? "未绑定邀请码，暂不能使用 AI"
+    : ai.providerMode === "personal"
+      ? "个人配置 · 不扣系统额度"
+      : ai.unlimited
+        ? `系统服务 · 邀请码 ${ai.inviteCode} · 不限次数`
+        : `系统服务 · 今日剩余 ${ai.remaining} / ${ai.limit} 次`;
+  const unavailable = !allowed || !ai.configured;
+  if (compact)
+    return (
+      <p
+        className="hint ai-status-compact"
+        title={
+          !allowed
+            ? "在设置中填写邀请码后即可使用 AI"
+            : undefined
+        }
+      >
+        {usage}
+        {unavailable && " · 暂不可用"}。
+      </p>
+    );
   return (
     <p className="hint">
-      {ai.providerMode === "personal"
-        ? "个人配置 · 不扣系统额度"
-        : `系统服务 · 今日剩余 ${ai.remaining} / ${ai.limit} 次`}
-      {!ai.configured && " · 暂不可用"}。每天上海时间 00:00 重置。
+      {usage}
+      {unavailable && " · 暂不可用"}。
+      {!allowed && " 在“邀请码”一栏填写有效邀请码后即可使用。"}
     </p>
   );
 }
 export function PersonalAi({ state, refresh }: any) {
+  const allowed = state.ai?.allowed === true;
   const [config, setConfig] = useState<any>(null),
     [key, setKey] = useState(""),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [message, setMessage] = useState("");
   useEffect(() => {
+    if (!allowed) return;
     api("ai/config")
       .then(setConfig)
       .catch((e) => setError(e.message));
-  }, []);
+  }, [allowed]);
   return (
     <section className="panel">
       <h2>AI 服务</h2>
       <AiStatus ai={state.ai} />
-      <details>
-        <summary>自定义 AI 服务</summary>
-        {config && (
-          <form
-            className="enhancement-form"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              setBusy(true);
-              setError("");
-              try {
-                setConfig(
-                  await api("ai/config", { ...config, key: key || undefined }),
-                );
-                setKey("");
-                await refresh();
-                setMessage("个人配置已保存");
-              } catch (e) {
-                setError((e as Error).message);
-              } finally {
-                setBusy(false);
-              }
+      {!allowed && (
+        <p className="hint">
+          未绑定邀请码的用户暂不能使用 AI；请先在“邀请码”一栏绑定有效邀请码。
+        </p>
+      )}
+      <div className="ai-service-stack">
+        <details className="ai-service-details">
+          <summary
+            className="button secondary ai-service-toggle"
+            aria-disabled={!allowed}
+            onClick={(e) => {
+              if (!allowed) e.preventDefault();
             }}
           >
-            <label className="check-field">
-              <input
-                type="checkbox"
-                checked={config.enabled}
-                onChange={(e) =>
-                  setConfig({ ...config, enabled: e.target.checked })
+            <span>自定义 AI 服务</span>
+            <ChevronDown size={16} aria-hidden="true" />
+          </summary>
+          {allowed && config && (
+            <form
+              className="enhancement-form"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setBusy(true);
+                setError("");
+                try {
+                  setConfig(
+                    await api("ai/config", {
+                      ...config,
+                      key: key || undefined,
+                    }),
+                  );
+                  setKey("");
+                  await refresh();
+                  setMessage("个人配置已保存");
+                } catch (e) {
+                  setError((e as Error).message);
+                } finally {
+                  setBusy(false);
                 }
-              />
-              启用个人配置
-            </label>
-            {[
-              ["baseUrl", "接口地址"],
-              ["textModel", "文本模型"],
-              ["visionModel", "图片模型（可选）"],
-            ].map(([field, label]) => (
-              <label className="field" key={field}>
-                <span>{label}</span>
+              }}
+            >
+              <label className="check-field">
                 <input
-                  value={config[field]}
+                  type="checkbox"
+                  checked={config.enabled}
                   onChange={(e) =>
-                    setConfig({ ...config, [field]: e.target.value })
+                    setConfig({ ...config, enabled: e.target.checked })
                   }
                 />
+                启用个人配置
               </label>
-            ))}
-            <label className="field">
-              <span>密钥{config.hasKey ? "（已保存，留空保留）" : ""}</span>
-              <input
-                type="password"
-                autoComplete="new-password"
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-                placeholder={config.hasKey ? "••••••••" : "填写个人服务密钥"}
-              />
-            </label>
-            <p className="hint">
-              启用后所有 AI
-              任务使用个人服务。连接失败时可停用，主动切回系统服务。
-            </p>
-            <button className="button" disabled={busy}>
-              {busy ? <Busy /> : "保存 AI 配置"}
-            </button>
-          </form>
-        )}
-      </details>
-      <button
-        className="button secondary"
-        disabled={busy}
-        onClick={async () => {
-          setBusy(true);
-          setError("");
-          try {
-            const r = await api("ai/test", {});
-            setMessage(
-              r.inference
-                ? "个人服务连接成功"
-                : r.ok
-                  ? "系统服务已配置（未发起推理）"
-                  : "系统服务暂未配置",
-            );
-          } catch (e) {
-            setError((e as Error).message);
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        检查当前服务
-      </button>
-      {error && <p className="error">{error}</p>}
-      {message && <p role="status">{message}</p>}
+              {[
+                ["baseUrl", "接口地址"],
+                ["textModel", "文本模型"],
+                ["visionModel", "图片模型（可选）"],
+              ].map(([field, label]) => (
+                <label className="field" key={field}>
+                  <span>{label}</span>
+                  <input
+                    value={config[field]}
+                    onChange={(e) =>
+                      setConfig({ ...config, [field]: e.target.value })
+                    }
+                  />
+                </label>
+              ))}
+              <label className="field">
+                <span>密钥{config.hasKey ? "（已保存，留空保留）" : ""}</span>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={key}
+                  onChange={(e) => setKey(e.target.value)}
+                  placeholder={config.hasKey ? "••••••••" : "填写个人服务密钥"}
+                />
+              </label>
+              <p className="hint">
+                启用后所有 AI
+                任务使用个人服务。连接失败时可停用，主动切回系统服务。
+              </p>
+              <button className="button" disabled={busy}>
+                {busy ? <Busy /> : "保存 AI 配置"}
+              </button>
+            </form>
+          )}
+        </details>
+        <button
+          className="button secondary"
+          disabled={busy || !allowed}
+          onClick={async () => {
+            setBusy(true);
+            setError("");
+            try {
+              const r = await api("ai/test", {});
+              setMessage(
+                r.inference
+                  ? "个人服务连接成功"
+                  : r.ok
+                    ? "系统服务已配置（未发起推理）"
+                    : "系统服务暂未配置",
+              );
+            } catch (e) {
+              setError((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          检查当前服务
+        </button>
+        {error && <p className="error">{error}</p>}
+        {message && <p role="status">{message}</p>}
+      </div>
     </section>
   );
 }
 
-export function GroupControls({ state, entity, selected, mutate }: any) {
+export function GroupControls({
+  state,
+  entity,
+  selected,
+  mutate,
+  notify,
+}: any) {
   const [open, setOpen] = useState(false),
     [groupId, setGroupId] = useState(""),
     [name, setName] = useState(""),
@@ -138,8 +188,10 @@ export function GroupControls({ state, entity, selected, mutate }: any) {
     try {
       await mutate(body);
       setName("");
+      return true;
     } catch (e) {
       setError((e as Error).message);
+      return false;
     } finally {
       setBusy(false);
     }
@@ -162,7 +214,13 @@ export function GroupControls({ state, entity, selected, mutate }: any) {
             <button
               disabled={busy || !name.trim()}
               className="button secondary"
-              onClick={() => run({ action: "groupSave", name })}
+              onClick={async () => {
+                const groupName = name.trim();
+                if (await run({ action: "groupSave", name: groupName })) {
+                  notify?.(`已创建分组「${groupName}」`);
+                  setOpen(false);
+                }
+              }}
             >
               创建组
             </button>
@@ -306,6 +364,31 @@ export function ListActions({ state, list, mutate }: any) {
   const refunded = state.ledger
     .filter((e: any) => entries.some((p: any) => p.id === e.refundOfId))
     .reduce((s: number, e: any) => s + e.amount, 0);
+  const itemBudgetTotal = items.reduce(
+      (s: number, i: any) => s + (i.budget || 0),
+      0,
+    ),
+    linkedTotal = entries.reduce((s: number, e: any) => s + e.amount, 0),
+    remaining = list.budget == null ? null : list.budget - paid,
+    usedPercent =
+      list.budget == null
+        ? null
+        : list.budget > 0
+          ? Math.round((paid / list.budget) * 100)
+          : paid > 0
+            ? 100
+            : 0,
+    meterWidth =
+      usedPercent == null ? 0 : Math.min(100, Math.max(0, usedPercent)),
+    overBudget = remaining != null && remaining < 0,
+    pendingCount = items.filter((i: any) =>
+      ["planned", "considering"].includes(i.status),
+    ).length,
+    unrecordedCount = items.filter(
+      (i: any) =>
+        i.status === "purchased" && !i.ledgerId && i.purchaseAmount !== 0,
+    ).length,
+    settlement = state.settlements.find((s: any) => s.listId === list.id);
   async function run(body: any) {
     setBusy(true);
     setError("");
@@ -318,36 +401,110 @@ export function ListActions({ state, list, mutate }: any) {
       setBusy(false);
     }
   }
+  async function openPreview() {
+    setError("");
+    setConfirmed(false);
+    try {
+      setPreview(
+        await api("mutate", {
+          action: "listSettlementPreview",
+          id: list.id,
+        }),
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
   return (
     <section className="panel list-budget">
-      <p>
-        总预算：{list.budget == null ? "未设置预算" : `¥${money(list.budget)}`}{" "}
-        · 已购实付 ¥{money(paid)} · 已关联账本 ¥
-        {money(entries.reduce((s: number, e: any) => s + e.amount, 0))} · 退款 ¥
-        {money(refunded)}
-      </p>
-      <p>
-        预算余量：{list.budget == null ? "—" : `¥${money(list.budget - paid)}`}{" "}
-        · 未购{" "}
-        {
-          items.filter((i: any) =>
-            ["planned", "considering"].includes(i.status),
-          ).length
-        }{" "}
-        项 · 已购未记账{" "}
-        {
-          items.filter(
-            (i: any) =>
-              i.status === "purchased" && !i.ledgerId && i.purchaseAmount !== 0,
-          ).length
-        }{" "}
-        项 · {list.savingMode === "budget" ? "按整单预算结算" : "按商品记录"}
-      </p>
-      {state.settlements.find((s: any) => s.listId === list.id)?.status ===
-        "pending" && (
-        <p className="error">预算结余待核对，已暂停计入有效省钱。</p>
+      <header className="budget-head">
+        <div className="budget-title">
+          <span className="budget-title-mark" aria-hidden="true" />
+          <h3>本单预算</h3>
+        </div>
+        <div className="budget-head-meta">
+          <span className="budget-mode">
+            {list.savingMode === "budget" ? "按整单预算结算" : "按商品记录"}
+          </span>
+          <button
+            className="text-button budget-settle"
+            disabled={busy}
+            onClick={openPreview}
+          >
+            预算结算 / 核算方式
+          </button>
+        </div>
+      </header>
+      <div
+        className={`budget-balance${overBudget ? " is-over" : ""}${
+          list.budget == null ? " is-unset" : ""
+        }`}
+      >
+        <div className="budget-balance-main">
+          <span>{overBudget ? "已超出预算" : "剩余预算"}</span>
+          <strong>
+            {list.budget == null
+              ? "未设置"
+              : overBudget
+                ? `−¥${money(Math.abs(remaining ?? 0))}`
+                : `¥${money(remaining ?? 0)}`}
+          </strong>
+          <small>
+            {list.budget == null
+              ? "填入总预算后，这里会显示剩余可用"
+              : overBudget
+                ? `已用 ${usedPercent}% · 超出 ¥${money(
+                    Math.abs(remaining ?? 0),
+                  )}`
+                : `已用 ${usedPercent}% · 总预算 ¥${money(list.budget)}`}
+          </small>
+        </div>
+        <div className="budget-meter-wrap">
+          <div
+            className={`budget-meter${overBudget ? " is-over" : ""}${
+              list.budget == null ? " is-unset" : ""
+            }`}
+            {...(list.budget == null
+              ? {}
+              : {
+                  role: "progressbar",
+                  "aria-label": "预算使用进度",
+                  "aria-valuemin": 0,
+                  "aria-valuemax": 100,
+                  "aria-valuenow": Math.min(100, usedPercent ?? 0),
+                  "aria-valuetext": `已用 ${usedPercent}%`,
+                })}
+          >
+            <span style={{ width: `${meterWidth}%` }} />
+          </div>
+          <div className="budget-flags">
+            <span>
+              <b>{pendingCount}</b> 项未购
+            </span>
+            <span>
+              <b>{unrecordedCount}</b> 项已购未记账
+            </span>
+          </div>
+        </div>
+      </div>
+      <dl className="budget-figures">
+        <div>
+          <dt>已购实付</dt>
+          <dd>¥{money(paid)}</dd>
+        </div>
+        <div>
+          <dt>已关联账本</dt>
+          <dd>¥{money(linkedTotal)}</dd>
+        </div>
+        <div>
+          <dt>退款</dt>
+          <dd>¥{money(refunded)}</dd>
+        </div>
+      </dl>
+      {settlement?.status === "pending" && (
+        <p className="budget-note">预算结余待核对，已暂停计入有效省钱。</p>
       )}
-      <div className="row-actions">
+      <div className="budget-actions">
         <button
           className="button"
           disabled={list.archived || !!list.closedAt}
@@ -358,6 +515,7 @@ export function ListActions({ state, list, mutate }: any) {
         <button
           className="button secondary"
           disabled={busy}
+          title={`将物品预算合计 ¥${money(itemBudgetTotal)} 填入总预算`}
           onClick={() =>
             run({
               action: "save",
@@ -365,35 +523,12 @@ export function ListActions({ state, list, mutate }: any) {
               id: list.id,
               version: list.version,
               data: {
-                budget: items.reduce(
-                  (s: number, i: any) => s + (i.budget || 0),
-                  0,
-                ),
+                budget: itemBudgetTotal,
               },
             })
           }
         >
           用物品预算合计填入总预算
-        </button>
-        <button
-          className="button secondary"
-          disabled={busy}
-          onClick={async () => {
-            setError("");
-            setConfirmed(false);
-            try {
-              setPreview(
-                await api("mutate", {
-                  action: "listSettlementPreview",
-                  id: list.id,
-                }),
-              );
-            } catch (e) {
-              setError((e as Error).message);
-            }
-          }}
-        >
-          预算结算 / 核算方式
         </button>
         {list.closedAt && (
           <button
@@ -843,7 +978,8 @@ export function Classification({
             busy ||
             !records.length ||
             records.length > 50 ||
-            !state.ai.configured
+            !state.ai.configured ||
+            !state.ai.allowed
           }
           onClick={async () => {
             const operationId = crypto.randomUUID();

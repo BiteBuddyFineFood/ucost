@@ -5,12 +5,13 @@ import {
   randomBytes,
   randomUUID,
 } from "node:crypto";
-import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { request as httpsRequest } from "node:https";
-import { request as httpRequest } from "node:http";
 import { z } from "zod";
-import { db, writeTransaction } from "./db";
+import { db, writeBatch } from "./db";
+import { reserveQuota } from "./store";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+import { setting } from "./environment";
+import { inviteAccess } from "./invites";
 import { localDate } from "@/lib/domain";
 
 type Provider = {
@@ -28,7 +29,7 @@ const context = new AsyncLocalStorage<{
   leaseId: string;
 }>();
 function encryptionKey() {
-  const key = process.env.AI_CONFIG_ENCRYPTION_KEY;
+  const key = setting("AI_CONFIG_ENCRYPTION_KEY");
   if (!key || !/^[a-f\d]{64}$/i.test(key))
     throw new Error("服务端尚未配置个人 AI 的加密主密钥");
   return Buffer.from(key, "hex");
@@ -89,24 +90,20 @@ async function destination(base: string) {
   if (url.username || url.password || url.search || url.hash)
     throw new Error("接口地址不能包含凭据、查询参数或片段");
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
-  const localAllowed =
-    process.env.AI_ALLOW_LOCAL_ENDPOINTS === "true" &&
-    ["localhost", "127.0.0.1", "::1"].includes(hostname);
-  if (url.protocol !== "https:" && !(localAllowed && url.protocol === "http:"))
+  if (url.protocol !== "https:")
     throw new Error("个人 AI 地址必须使用 HTTPS");
-  const addresses = isIP(hostname)
-    ? [{ address: hostname, family: isIP(hostname) }]
-    : await lookup(hostname, { all: true });
-  if (
-    !addresses.length ||
-    (!localAllowed && addresses.some((a) => !publicAddress(a.address)))
-  )
+  if (hostname === "localhost" || hostname.endsWith(".localhost") || (isIP(hostname) && !publicAddress(hostname)))
     throw new Error("AI 地址不能访问内网、回环或元数据服务");
-  return { url, address: addresses[0] };
+  const allowed = (setting("AI_ALLOWED_ORIGINS") || "https://api.openai.com,https://api.deepseek.com")
+    .split(",").map(s => s.trim()).filter(Boolean);
+  if (!allowed.includes(url.origin))
+    throw new Error("AI 地址未在服务端可信服务列表中，请联系部署者添加 HTTPS origin");
+  return { url };
 }
 
 export async function aiConfig(ownerId: string) {
-  const config = await db.userAiConfig.findUnique({ where: { ownerId } });
+  await requireInviteForAi(ownerId);
+  const config = await db.userAiConfig.first({ where: { ownerId } });
   return config
     ? {
         enabled: config.enabled,
@@ -126,6 +123,7 @@ export async function aiConfig(ownerId: string) {
       };
 }
 export async function saveAiConfig(ownerId: string, input: unknown) {
+  await requireInviteForAi(ownerId);
   const body = z
     .object({
       enabled: z.boolean(),
@@ -140,8 +138,8 @@ export async function saveAiConfig(ownerId: string, input: unknown) {
     await destination(body.baseUrl);
     if (!body.textModel.trim()) throw new Error("请填写文本模型");
   }
-  await writeTransaction(async (tx) => {
-    const previous = await tx.userAiConfig.findUnique({ where: { ownerId } });
+  await writeBatch(async (tx) => {
+    const previous = await tx.userAiConfig.first({ where: { ownerId } });
     if ((previous?.version ?? 0) !== body.version)
       throw new Error("AI 配置已更新，请刷新");
     const encryptedKey = body.key
@@ -155,7 +153,7 @@ export async function saveAiConfig(ownerId: string, input: unknown) {
       visionModel: body.visionModel,
       encryptedKey,
     };
-    await tx.userAiConfig.upsert({
+    await tx.userAiConfig.put({
       where: { ownerId },
       create: { ...data, ownerId },
       update: { ...data, version: { increment: 1 } },
@@ -164,7 +162,7 @@ export async function saveAiConfig(ownerId: string, input: unknown) {
   return aiConfig(ownerId);
 }
 async function provider(ownerId: string): Promise<Provider> {
-  const personal = await db.userAiConfig.findUnique({ where: { ownerId } });
+  const personal = await db.userAiConfig.first({ where: { ownerId } });
   if (personal?.enabled)
     return {
       mode: "personal",
@@ -174,38 +172,39 @@ async function provider(ownerId: string): Promise<Provider> {
       visionModel: personal.visionModel,
     };
   if (
-    !process.env.AI_API_KEY ||
-    !process.env.AI_BASE_URL ||
-    !process.env.AI_TEXT_MODEL
+    !setting("AI_API_KEY") ||
+    !setting("AI_BASE_URL") ||
+    !setting("AI_TEXT_MODEL")
   )
     throw new Error(
       "AI 服务暂不可用，请配置系统服务或启用个人配置；仍可暂存与手动整理",
     );
   return {
     mode: "system",
-    base: process.env.AI_BASE_URL,
-    key: process.env.AI_API_KEY,
-    textModel: process.env.AI_TEXT_MODEL,
-    visionModel: process.env.AI_VISION_MODEL || "",
+    base: setting("AI_BASE_URL"),
+    key: setting("AI_API_KEY"),
+    textModel: setting("AI_TEXT_MODEL"),
+    visionModel: setting("AI_VISION_MODEL"),
   };
 }
 
 async function expireTasks(ownerId: string) {
-  await writeTransaction(async (tx) => {
-    const expired = await tx.aiTask.findMany({
-      where: { ownerId, status: "running", leaseUntil: { lt: new Date() } },
+  await writeBatch(async (tx) => {
+    const unlimited = !!(await inviteAccess(tx, ownerId));
+    const expired = await tx.aiTask.list({
+      where: { ownerId, status: { in: ["running", "paused"] }, leaseUntil: { lt: new Date() } },
     });
     for (const task of expired) {
       const progress = JSON.parse(task.result || "null");
       const hasUsableResult =
-        Array.isArray(progress?.steps) &&
-        progress.steps.some((step: any) => Number(step.count) > 0);
-      const claimed = await tx.aiTask.updateMany({
-        where: { id: task.id, status: "running", leaseId: task.leaseId },
+        Array.isArray(progress?.steps || progress?.results) &&
+        (progress.steps || progress.results).some((step: any) => Number(step.count) > 0);
+      const claimed = await tx.aiTask.changeAll({
+        where: { id: task.id, status: task.status, leaseId: task.leaseId },
         data: { status: "failed", error: "任务超时，请创建新任务" },
       });
-      if (claimed.count && task.providerMode === "system")
-        await tx.aiDailyUsage.update({
+      if (claimed.count && task.providerMode === "system" && !unlimited)
+        await tx.aiDailyUsage.change({
           where: { ownerId_quotaDate: { ownerId, quotaDate: task.quotaDate } },
           data: {
             reserved: { decrement: 1 },
@@ -218,28 +217,43 @@ async function expireTasks(ownerId: string) {
 export async function aiUsage(ownerId: string) {
   await expireTasks(ownerId);
   const quotaDate = localDate(),
-    config = await db.userAiConfig.findUnique({ where: { ownerId } });
-  const usage = await db.aiDailyUsage.findUnique({
+    config = await db.userAiConfig.first({ where: { ownerId } }),
+    redemption = await inviteAccess(db, ownerId);
+  const gateOpen = setting("AI_REQUIRE_INVITE") === "false";
+  const usage = await db.aiDailyUsage.first({
     where: { ownerId_quotaDate: { ownerId, quotaDate } },
   });
+  const unlimited = !!redemption;
+  const allowed = unlimited || gateOpen;
   return {
+    allowed,
     configured:
       !!config?.enabled ||
       !!(
-        process.env.AI_API_KEY &&
-        process.env.AI_BASE_URL &&
-        process.env.AI_TEXT_MODEL
+        setting("AI_API_KEY") &&
+        setting("AI_BASE_URL") &&
+        setting("AI_TEXT_MODEL")
       ),
     providerMode: config?.enabled ? "personal" : "system",
-    limit: 10,
+    unlimited,
+    inviteCode: redemption?.code ?? null,
+    limit: unlimited ? null : 10,
     used: usage?.used ?? 0,
     reserved: usage?.reserved ?? 0,
-    remaining: Math.max(0, 10 - (usage?.used ?? 0) - (usage?.reserved ?? 0)),
+    remaining: unlimited
+      ? null
+      : Math.max(0, 10 - (usage?.used ?? 0) - (usage?.reserved ?? 0)),
     quotaDate,
     resetsAt: new Date(
       Date.parse(`${quotaDate}T00:00:00+08:00`) + 86400000,
     ).toISOString(),
   };
+}
+
+export async function requireInviteForAi(ownerId: string) {
+  if (setting("AI_REQUIRE_INVITE") === "false") return;
+  if (!(await inviteAccess(db, ownerId)))
+    throw new Error("未绑定邀请码，暂不能使用 AI；请在设置中填写邀请码");
 }
 
 export async function runAiTask<T>(
@@ -250,6 +264,7 @@ export async function runAiTask<T>(
   action: () => Promise<T>,
   usable: (result: T) => boolean = () => true,
 ): Promise<T> {
+  await requireInviteForAi(ownerId);
   const op = z
     .string()
     .min(1)
@@ -258,7 +273,7 @@ export async function runAiTask<T>(
   const serialized = JSON.stringify(input);
   if (serialized.length > 150000) throw new Error("AI 任务输入过长，请拆分");
   await expireTasks(ownerId);
-  const existing = await db.aiTask.findUnique({
+  const existing = await db.aiTask.first({
     where: { ownerId_operationId: { ownerId, operationId: op } },
   });
   if (existing) {
@@ -267,17 +282,26 @@ export async function runAiTask<T>(
     if (existing.expiresAt.getTime() < Date.now())
       throw new Error("AI 任务已过期，请创建新任务");
     if (existing.status === "succeeded") return JSON.parse(existing.result);
-    throw new Error(
+    if (!(kind === "process" && existing.status === "paused")) throw new Error(
       existing.status === "running"
         ? "AI 任务正在执行，请稍后读取进度"
         : existing.error || "任务失败，请创建新任务重试",
     );
   }
   const selected = await provider(ownerId),
-    quotaDate = localDate(),
+    quotaDate = existing?.quotaDate || localDate(),
     leaseId = randomUUID();
-  const task = await writeTransaction(
+  const task = await writeBatch(
     async (tx) => {
+      if (existing?.status === "paused") {
+        if (selected.mode !== existing.providerMode) throw new Error("AI 服务模式已更改，请创建新任务");
+        const claim = await tx.aiTask.changeAll({
+          where: { id: existing.id, status: "paused", leaseId: existing.leaseId },
+          data: { status: "running", leaseId, leaseUntil: new Date(Date.now() + 110000) },
+        });
+        if (!claim.count) throw new Error("AI 任务正在执行，请稍后读取进度");
+        return tx.aiTask.require({ where: { id: existing.id } });
+      }
       const recent = await tx.aiTask.count({
         where: { ownerId, createdAt: { gt: new Date(Date.now() - 60000) } },
       });
@@ -298,19 +322,21 @@ export async function runAiTask<T>(
       )
         throw new Error("已有两个 AI 任务执行中，请稍后再试");
       if (selected.mode === "system") {
-        await tx.aiDailyUsage.upsert({
-          where: { ownerId_quotaDate: { ownerId, quotaDate } },
-          create: { ownerId, quotaDate },
-          update: {},
-        });
-        const reserved =
-          await tx.$executeRaw`UPDATE "AiDailyUsage" SET "reserved" = "reserved" + 1 WHERE "ownerId" = ${ownerId} AND "quotaDate" = ${quotaDate} AND "used" + "reserved" < 10`;
-        if (!reserved)
-          throw new Error(
-            "今日系统 AI 额度已用完，上海时间明日 00:00 重置；仍可暂存和手动整理",
-          );
+        if (!(await inviteAccess(tx, ownerId))) {
+          await tx.aiDailyUsage.put({
+            where: { ownerId_quotaDate: { ownerId, quotaDate } },
+            create: { ownerId, quotaDate },
+            update: {},
+          });
+          const reserved =
+            await reserveQuota(tx, ownerId, quotaDate);
+          if (!reserved)
+            throw new Error(
+              "今日系统 AI 额度已用完，上海时间明日 00:00 重置；仍可暂存和手动整理",
+            );
+        }
       }
-      return tx.aiTask.create({
+      return tx.aiTask.insert({
         data: {
           ownerId,
           operationId: op,
@@ -329,13 +355,14 @@ export async function runAiTask<T>(
   const state = {
     provider: selected,
     signal: AbortSignal.timeout(100000),
-    calls: 0,
+    calls: existing?.status === "paused" && JSON.parse(existing.result)?.results?.some((r: any) => r.count > 0) ? 1 : 0,
     taskId: task.id,
     leaseId,
   };
   async function finish(result: T | null, error?: string) {
-    await writeTransaction(async (tx) => {
-      const claim = await tx.aiTask.updateMany({
+    const paused = !error && kind === "process" && (result as any)?.remaining?.length > 0;
+    await writeBatch(async (tx) => {
+      const claim = await tx.aiTask.changeAll({
         where: {
           id: task.id,
           status: "running",
@@ -343,14 +370,19 @@ export async function runAiTask<T>(
           leaseUntil: { gt: new Date() },
         },
         data: {
-          status: error ? "failed" : "succeeded",
+          status: error ? "failed" : paused ? "paused" : "succeeded",
           error,
           result: JSON.stringify(result),
+          ...(paused ? { leaseUntil: new Date(Date.now() + 180000) } : {}),
         },
       });
       if (!claim.count) throw new Error("AI 任务执行租约已失效，结果未应用");
-      if (selected.mode === "system")
-        await tx.aiDailyUsage.update({
+      if (
+        selected.mode === "system" &&
+        !paused &&
+        !(await inviteAccess(tx, ownerId))
+      )
+        await tx.aiDailyUsage.change({
           where: { ownerId_quotaDate: { ownerId, quotaDate } },
           data: {
             reserved: { decrement: 1 },
@@ -368,7 +400,7 @@ export async function runAiTask<T>(
     const result = await context.run(state, action);
     await finish(
       result,
-      usable(result)
+      usable(result) || (kind === "process" && (result as any)?.remaining?.length > 0)
         ? undefined
         : "未产生可用结果，已释放额度；可创建新任务重试",
     );
@@ -393,7 +425,7 @@ export function assertAiLease() {
 export async function saveAiProgress(result: unknown) {
   const state = context.getStore();
   assertAiLease();
-  const saved = await db.aiTask.updateMany({
+  const saved = await db.aiTask.changeAll({
     where: {
       id: state!.taskId,
       leaseId: state!.leaseId,
@@ -410,8 +442,15 @@ export async function aiFetch(body: unknown): Promise<Response> {
   state.signal.throwIfAborted();
   state.calls++;
   const { provider: p } = state;
-  if (p.mode === "system")
-    return fetch(`${p.base.replace(/\/$/, "")}/chat/completions`, {
+  const { url } = await destination(p.base);
+  // An optional deployer-controlled service transport allows deterministic local
+  // integration tests without replacing validation, task accounting or parsing.
+  let transport: typeof fetch = fetch;
+  try {
+    const service = (await getCloudflareContext({ async: true })).env.AI_TRANSPORT;
+    if (service) transport = ((url: any, options: any) => service.fetch(new Request(url, options) as any)) as unknown as typeof fetch;
+  } catch { /* Node unit tests have no Workers request context. */ }
+  const response = await transport(`${url.href.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${p.key}`,
@@ -419,52 +458,18 @@ export async function aiFetch(body: unknown): Promise<Response> {
       },
       body: JSON.stringify(body),
       signal: state.signal,
-      redirect: "error",
+      redirect: "manual",
     });
-  // Resolve once per request, validate every address, and pin the socket to a validated IP.
-  const { url, address } = await destination(p.base);
-  url.pathname = `${url.pathname.replace(/\/$/, "")}/chat/completions`;
-  return new Promise((resolve, reject) => {
-    const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(
-      url,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${p.key}`,
-          "Content-Type": "application/json",
-        },
-        signal: state.signal,
-        lookup: (_hostname, options, callback: any) =>
-          (options as any).all
-            ? callback(null, [address])
-            : callback(null, address.address, address.family),
-      },
-      (response) => {
-        const chunks: Buffer[] = [];
-        let size = 0;
-        response.on("data", (chunk) => {
-          size += chunk.length;
-          if (size > 2_000_000) request.destroy(new Error("AI 响应超出限制"));
-          else chunks.push(chunk);
-        });
-        response.on("error", reject);
-        response.on("end", () =>
-          resolve(
-            new Response(Buffer.concat(chunks), {
-              status: response.statusCode || 502,
-            }),
-          ),
-        );
-      },
-    );
-    request.on("error", reject);
-    request.end(JSON.stringify(body));
-  });
+  if (response.status >= 300 && response.status < 400) {
+    await response.body?.cancel();
+    throw new Error("AI 地址不允许重定向，请使用最终可信接口地址");
+  }
+  return response;
 }
 
 export async function aiTaskStatus(ownerId: string, taskId: string) {
   await expireTasks(ownerId);
-  const task = await db.aiTask.findFirst({
+  const task = await db.aiTask.first({
     where: { ownerId, OR: [{ id: taskId }, { operationId: taskId }] },
   });
   if (!task) throw new Error("任务不存在或无权访问");
@@ -479,6 +484,7 @@ export async function aiTaskStatus(ownerId: string, taskId: string) {
 }
 
 export async function testPersonalConfig(ownerId: string) {
+  await requireInviteForAi(ownerId);
   const selected = await provider(ownerId);
   if (selected.mode !== "personal")
     return { ok: !!(await aiUsage(ownerId)).configured, inference: false };

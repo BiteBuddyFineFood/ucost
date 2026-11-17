@@ -5,19 +5,30 @@
   "scripts": {
     "dev": "next dev --hostname 0.0.0.0",
     "build": "next build",
-    "start": "next start --hostname 0.0.0.0",
+    "start": "node scripts/wrangler-local.mjs preview",
+    "build:workers": "node scripts/build-workers.mjs",
+    "preview:workers": "node scripts/wrangler-local.mjs preview",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "test:ai": "tsx scripts/verify-ai.ts",
-    "db:migrate": "node scripts/init-db.mjs",
+    "test:e2e:workers": "node scripts/e2e-workers.mjs",
+    "test:ai": "vitest run tests/p2-p3.test.ts tests/cloudflare.test.ts",
+    "db:migrate": "node scripts/wrangler-local.mjs migrate",
+    "db:verify": "node scripts/verify-d1.mjs --schema",
+    "db:schema": "node scripts/generate-d1.mjs",
+    "db:migrate:legacy": "node scripts/init-db.mjs",
     "db:generate": "prisma generate",
-    "db:seed": "tsx prisma/seed.ts"
+    "db:seed": "tsx scripts/local-tool.ts seed",
+    "invite:new": "tsx scripts/invite-tool.ts new",
+    "invite:list": "tsx scripts/invite-tool.ts list",
+    "invite:disable": "tsx scripts/invite-tool.ts disable",
+    "invite:enable": "tsx scripts/invite-tool.ts enable"
   },
   "dependencies": {
     "@prisma/client": "6.19.0",
     "bcryptjs": "^3.0.2",
+    "drizzle-orm": "0.45.4",
     "lucide-react": "^0.468.0",
     "next": "^16.0.0",
     "react": "^19.2.0",
@@ -26,6 +37,8 @@
     "zod": "^4.1.0"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "5.20261112.1",
+    "@opennextjs/cloudflare": "1.20.16",
     "@playwright/test": "^1.56.0",
     "@tailwindcss/postcss": "^4.1.0",
     "@types/node": "^22.0.0",
@@ -34,12 +47,14 @@
     "dotenv": "^18.0.10",
     "eslint": "^9.0.0",
     "eslint-config-next": "^16.0.0",
+    "miniflare": "5.20261006.0-alpha",
     "prettier": "^3.10.0",
     "prisma": "6.19.0",
     "tailwindcss": "^4.1.0",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0",
-    "vitest": "^3.2.0"
+    "vitest": "^3.2.0",
+    "wrangler": "4.148.0"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

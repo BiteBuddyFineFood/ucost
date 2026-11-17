@@ -4,7 +4,7 @@ import nextTs from "eslint-config-next/typescript";
 export default defineConfig([
   ...nextVitals,
   ...nextTs,
-  globalIgnores([".next*/**", "next-env.d.ts", "data/**"]),
+  globalIgnores([".next*/**", ".open-next/**", ".wrangler/**", "next-env.d.ts", "data/**"]),
   {
     rules: {
       "@typescript-eslint/no-explicit-any": "off",

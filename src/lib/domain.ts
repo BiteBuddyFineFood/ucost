@@ -71,6 +71,8 @@ export const draftTargetLabels: Record<string, string> = {
   ledger: "账本",
   shopping: "购物清单",
   items: "物品档案",
+  itemUpdate: "物品更新",
+  reminder: "提醒",
   savings: "省钱罐",
   text: "普通备忘",
 };
@@ -133,6 +135,64 @@ export function heldDays(
     ) + 1,
   );
 }
+
+export function itemNetCost(
+  item: { price?: number | null; recovery?: number | null; ledgerId?: string | null },
+  ledger?: { amount: number } | null,
+  refunds = 0,
+) {
+  return (ledger?.amount ?? item.price ?? 0) - refunds - (item.recovery ?? 0);
+}
+
+export function itemCostView(
+  item: {
+    costEnabled?: boolean;
+    price?: number | null;
+    recovery?: number | null;
+    purchaseDate?: string | null;
+    retiredDate?: string | null;
+    mode?: string;
+  },
+  options: {
+    ledger?: { amount: number } | null;
+    refunds?: number;
+    usageCount?: number;
+    today?: string;
+  } = {},
+) {
+  if (item.costEnabled === false || item.price == null)
+    return { value: null, unit: "", label: "未计算成本", secondary: null };
+  const net = itemNetCost(item, options.ledger, options.refunds);
+  const days = item.purchaseDate
+    ? heldDays(item.purchaseDate, item.retiredDate, options.today)
+    : 1;
+  const count = options.usageCount ?? 0;
+  const dayValue = net / days;
+  const useValue = count ? net / count : null;
+  if (item.mode === "use")
+    return useValue == null
+      ? {
+          value: null,
+          unit: "/次",
+          label: "暂无使用记录",
+          secondary: { value: dayValue, unit: "/天" },
+        }
+      : {
+          value: useValue,
+          unit: "/次",
+          label: "",
+          secondary: { value: dayValue, unit: "/天" },
+        };
+  return {
+    value: dayValue,
+    unit: "/天",
+    label: "",
+    secondary:
+      useValue == null
+        ? { value: null, unit: "/次", label: "暂无使用记录" }
+        : { value: useValue, unit: "/次" },
+  };
+}
 export function reviewResult(
   votes: { approve: boolean }[],
   count: number,
@@ -181,6 +241,7 @@ export function effectiveSaving(saving: {
 }
 export const defaultWidgets = [
   "summary",
+  "reminders",
   "trend",
   "savings",
   "categories",
@@ -191,6 +252,7 @@ export const defaultWidgets = [
 ];
 export const widgetNames: Record<string, string> = {
   summary: "收支概览",
+  reminders: "待处理提醒",
   trend: "收支趋势",
   savings: "省钱罐",
   categories: "支出分类",

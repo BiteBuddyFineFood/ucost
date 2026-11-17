@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ucost",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-10-13",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": { "directory": ".open-next/assets", "binding": "ASSETS" },
+  "services": [{ "binding": "WORKER_SELF_REFERENCE", "service": "ucost" }],
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "ucost",
+    "database_id": "f340e026-b4f9-4ff4-a2a1-8ed2ac965d9d",
+    "migrations_dir": "d1/migrations"
+  }],
+  "vars": {
+    "APP_URL": "https://ucost.my-vibe.workers.dev",
+    "AI_REQUIRE_INVITE": "true",
+    "AI_ALLOWED_ORIGINS": "https://openrouter.ai,https://apihub.agnes-ai.com,https://api.openai.com,https://api.deepseek.com"
+  }
+}

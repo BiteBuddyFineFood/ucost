@@ -1,0 +1,9 @@
+{
+  "name": "ucost-d1-test",
+  "compatibility_date": "2026-10-13",
+  "d1_databases": [{
+    "binding": "DB", "database_name": "ucost-isolated-test",
+    "database_id": "00000000-0000-0000-0000-000000000003",
+    "migrations_dir": "d1/migrations"
+  }]
+}

@@ -9,7 +9,6 @@ import {
   vi,
 } from "vitest";
 import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
 import { db } from "../src/server/db";
 import { mutate, snapshot } from "../src/server/services";
 import { effectiveSaving, localDate } from "../src/lib/domain";
@@ -21,8 +20,11 @@ import {
   publicAddress,
 } from "../src/server/ai-gateway";
 import {
+  applyDraft,
   callAI,
-  processDrafts,
+  chat,
+  processDraft,
+  processDrafts as processDraftChunk,
   suggest,
   analyze,
   polish,
@@ -33,6 +35,13 @@ import {
 } from "../src/server/classification";
 
 const op = () => randomUUID();
+async function processDrafts(user: any, body: any) {
+  const operationId = body.operationId || op();
+  let result = await processDraftChunk(user, { ...body, operationId });
+  while (result.remaining.length)
+    result = await processDraftChunk(user, { ...body, ids: result.remaining, operationId });
+  return result;
+}
 let user: any, other: any;
 const action = (body: any) =>
   mutate(user, { operationId: op(), ...body }) as Promise<any>;
@@ -44,10 +53,10 @@ const save = (entity: string, data: any, record?: any) =>
     ...(record ? { id: record.id, version: record.version } : {}),
   });
 beforeAll(async () => {
-  user = await db.user.create({
+  user = await db.user.insert({
     data: { username: `p2-p3-${op()}`, passwordHash: "test" },
   });
-  other = await db.user.create({
+  other = await db.user.insert({
     data: { username: `p2-p3-${op()}`, passwordHash: "test" },
   });
 });
@@ -72,12 +81,12 @@ afterAll(async () => {
     "aiAnalysis",
     "appliedOperation",
   ])
-    await (db as any)[model].deleteMany({
+    await (db as any)[model].removeAll({
       where: { ownerId: { in: [user.id, other.id] } },
     });
-  await db.user.deleteMany({ where: { id: { in: [user.id, other.id] } } });
+  await db.user.removeAll({ where: { id: { in: [user.id, other.id] } } });
   vi.unstubAllEnvs();
-  await db.$disconnect();
+
 });
 async function preview(listId: string) {
   return action({ action: "listSettlementPreview", id: listId });
@@ -114,11 +123,11 @@ async function shoppingFixture(budget = 100000) {
 describe("P2 组、批量记账、整单结算", () => {
   it("预算1000实付800优惠50只累计200；重算复用结算；主动停用不恢复", async () => {
     const { list, item } = await shoppingFixture();
-    const originalSaving = await db.savingEntry.findFirstOrThrow({
+    const originalSaving = await db.savingEntry.require({
       where: { ledgerId: item.ledgerId },
     });
     await settle(list.id);
-    let savings = await db.savingEntry.findMany({
+    let savings = await db.savingEntry.list({
       where: { ownerId: user.id, sourceListId: list.id },
     });
     expect(
@@ -139,7 +148,7 @@ describe("P2 组、批量记账、整单结算", () => {
         },
       ],
     });
-    const currentList = await db.shoppingList.findUniqueOrThrow({
+    const currentList = await db.shoppingList.require({
       where: { id: list.id },
     });
     await action({
@@ -149,13 +158,13 @@ describe("P2 组、批量记账、整单结算", () => {
     });
     expect(
       (
-        await db.savingEntry.findUniqueOrThrow({
+        await db.savingEntry.require({
           where: { id: originalSettlement.id },
         })
       ).status,
     ).toBe("pending");
     await settle(list.id);
-    savings = await db.savingEntry.findMany({
+    savings = await db.savingEntry.list({
       where: { sourceListId: list.id },
     });
     expect(savings.find((s) => s.settlementId)?.id).toBe(originalSettlement.id);
@@ -168,14 +177,14 @@ describe("P2 组、批量记账、整单结算", () => {
     });
     expect(
       (
-        await db.savingEntry.findUniqueOrThrow({
+        await db.savingEntry.require({
           where: { id: originalSaving.id },
         })
       ).suppressed,
     ).toBe(true);
     expect(
       (
-        await db.savingEntry.findMany({ where: { sourceListId: list.id } })
+        await db.savingEntry.list({ where: { sourceListId: list.id } })
       ).filter(effectiveSaving),
     ).toHaveLength(0);
   });
@@ -194,7 +203,7 @@ describe("P2 组、批量记账、整单结算", () => {
       date: "2026-11-12",
       createLedger: true,
     });
-    const entries = await db.ledgerEntry.findMany({
+    const entries = await db.ledgerEntry.list({
       where: { id: { in: [item.ledgerId, purchased.ledgerId] } },
     });
     expect(new Set(entries.map((e) => e.groupId)).size).toBe(1);
@@ -221,14 +230,14 @@ describe("P2 组、批量记账、整单结算", () => {
       date: localDate(),
       createLedger: true,
     });
-    const groups = await db.recordGroup.findMany({
+    const groups = await db.recordGroup.list({
       where: { sourceListId: { in: [list.id, sameName.id] } },
     });
     expect(groups).toHaveLength(2);
     const renamed = await save("lists", { name: "新名称" }, list);
     expect(
       (
-        await db.recordGroup.findUniqueOrThrow({
+        await db.recordGroup.require({
           where: { sourceListId: list.id },
         })
       ).name,
@@ -246,7 +255,7 @@ describe("P2 组、批量记账、整单结算", () => {
     ).toBe(2);
     expect(
       (
-        await db.recordGroup.findUniqueOrThrow({
+        await db.recordGroup.require({
           where: { sourceListId: list.id },
         })
       ).sourceDeleted,
@@ -293,7 +302,7 @@ describe("P2 组、批量记账、整单结算", () => {
         where: { ownerId: user.id, name: { in: ["付费物品", "免费物品"] } },
       }),
     ).toBe(2);
-    const updated = await db.shoppingItem.findUniqueOrThrow({
+    const updated = await db.shoppingItem.require({
       where: { id: first.id },
     });
     await action({
@@ -315,7 +324,7 @@ describe("P2 组、批量记账、整单结算", () => {
       listId: list.id,
       name: "回滚物品",
     });
-    const foreign = await db.shoppingItem.create({
+    const foreign = await db.shoppingItem.insert({
       data: { ownerId: other.id, listId: list.id, name: "他人物品" },
     });
     await expect(
@@ -329,14 +338,14 @@ describe("P2 组、批量记账、整单结算", () => {
       }),
     ).rejects.toThrow("无权访问");
     expect(
-      (await db.shoppingItem.findUniqueOrThrow({ where: { id: untouched.id } }))
+      (await db.shoppingItem.require({ where: { id: untouched.id } }))
         .ledgerId,
     ).toBeNull();
   });
   it("删除支出、退款及购买金额修正使预算省钱待核对；重新确认无重复", async () => {
     const { list, item } = await shoppingFixture();
     await settle(list.id);
-    const settlementSaving = await db.savingEntry.findFirstOrThrow({
+    const settlementSaving = await db.savingEntry.require({
       where: { sourceListId: list.id, type: "budget_surplus" },
     });
     await save("ledger", {
@@ -348,13 +357,13 @@ describe("P2 组、批量记账、整单结算", () => {
     });
     expect(
       (
-        await db.savingEntry.findUniqueOrThrow({
+        await db.savingEntry.require({
           where: { id: settlementSaving.id },
         })
       ).status,
     ).toBe("pending");
     await settle(list.id);
-    const current = await db.shoppingItem.findUniqueOrThrow({
+    const current = await db.shoppingItem.require({
       where: { id: item.id },
     });
     await action({
@@ -366,7 +375,7 @@ describe("P2 组、批量记账、整单结算", () => {
     });
     expect(
       (
-        await db.savingEntry.findUniqueOrThrow({
+        await db.savingEntry.require({
           where: { id: settlementSaving.id },
         })
       ).status,
@@ -374,7 +383,7 @@ describe("P2 组、批量记账、整单结算", () => {
     await settle(list.id);
     expect(
       (
-        await db.savingEntry.findUniqueOrThrow({
+        await db.savingEntry.require({
           where: { id: settlementSaving.id },
         })
       ).amount,
@@ -388,7 +397,7 @@ describe("P2 组、批量记账、整单结算", () => {
   it("未购、未知实付阻止结算；超预算不生成负省钱；预览过期拒绝", async () => {
     const { list } = await shoppingFixture(70000);
     await settle(list.id);
-    const surplus = await db.savingEntry.findFirstOrThrow({
+    const surplus = await db.savingEntry.require({
       where: { sourceListId: list.id, type: "budget_surplus" },
     });
     expect(surplus.amount).toBe(0);
@@ -406,7 +415,7 @@ describe("P2 组、批量记账、整单结算", () => {
         confirmedClosed: true,
       }),
     ).rejects.toThrow("已更新");
-    await db.shoppingItem.update({
+    await db.shoppingItem.change({
       where: { id: item.id },
       data: {
         status: "purchased",
@@ -418,7 +427,7 @@ describe("P2 组、批量记账、整单结算", () => {
   });
   it("删账后结算失效，补记复用物品档案且不重复生成省钱", async () => {
     const { list, item } = await shoppingFixture();
-    const asset = await db.ownedItem.create({
+    const asset = await db.ownedItem.insert({
       data: {
         ownerId: user.id,
         name: "复用档案",
@@ -427,12 +436,12 @@ describe("P2 组、批量记账、整单结算", () => {
         ledgerId: item.ledgerId,
       },
     });
-    await db.shoppingItem.update({
+    await db.shoppingItem.change({
       where: { id: item.id },
       data: { ownedItemId: asset.id },
     });
     await settle(list.id);
-    const entry = await db.ledgerEntry.findUniqueOrThrow({
+    const entry = await db.ledgerEntry.require({
       where: { id: item.ledgerId },
     });
     await action({
@@ -441,7 +450,7 @@ describe("P2 组、批量记账、整单结算", () => {
       mode: "delete",
       records: [{ id: entry.id, version: entry.version }],
     });
-    const missing = await db.shoppingItem.findUniqueOrThrow({
+    const missing = await db.shoppingItem.require({
       where: { id: item.id },
     });
     expect(missing.purchaseAmount).toBe(80000);
@@ -449,7 +458,7 @@ describe("P2 组、批量记账、整单结算", () => {
     expect(missing.ledgerId).toBeNull();
     expect(
       (
-        await db.savingEntry.findFirstOrThrow({
+        await db.savingEntry.require({
           where: { sourceListId: list.id, type: "budget_surplus" },
         })
       ).status,
@@ -458,7 +467,7 @@ describe("P2 组、批量记账、整单结算", () => {
       action: "listReopen",
       id: list.id,
       version: (
-        await db.shoppingList.findUniqueOrThrow({ where: { id: list.id } })
+        await db.shoppingList.require({ where: { id: list.id } })
       ).version,
     });
     const relinked = await action({
@@ -475,14 +484,14 @@ describe("P2 组、批量记账、整单结算", () => {
     expect(relinked.entry.sourceShoppingItemId).toBeNull();
     expect(
       (
-        await db.ledgerEntry.findUniqueOrThrow({
+        await db.ledgerEntry.require({
           where: { id: relinked.entry.id },
         })
       ).sourceShoppingItemId,
     ).toBe(item.id);
     await settle(list.id);
     expect(
-      (await db.savingEntry.findMany({ where: { sourceListId: list.id } }))
+      (await db.savingEntry.list({ where: { sourceListId: list.id } }))
         .filter(effectiveSaving)
         .reduce((s, r) => s + r.amount, 0),
     ).toBe(20000);
@@ -522,10 +531,10 @@ describe("P2 组、批量记账、整单结算", () => {
       date: "2026-10-31",
       createLedger: true,
     });
-    const group = await db.recordGroup.findUniqueOrThrow({
+    const group = await db.recordGroup.require({
       where: { sourceListId: list.id },
     });
-    const filtered = await db.ledgerEntry.findMany({
+    const filtered = await db.ledgerEntry.list({
       where: {
         ownerId: user.id,
         groupId: group.id,
@@ -542,13 +551,14 @@ describe("P2 组、批量记账、整单结算", () => {
     });
     expect((await preview(list.id)).paid).toBe(paid);
     expect(
-      (await db.ledgerEntry.findUniqueOrThrow({ where: { id: item.ledgerId } }))
+      (await db.ledgerEntry.require({ where: { id: item.ledgerId } }))
         .sourceShoppingItemId,
     ).toBe(item.id);
   });
 });
 
 function setupAI(answer: any = { ok: true }) {
+  vi.stubEnv("AI_ALLOWED_ORIGINS", "https://example.test,https://api.openai.com");
   vi.stubEnv("AI_API_KEY", "test-key");
   vi.stubEnv("AI_BASE_URL", "https://example.test/v1");
   vi.stubEnv("AI_TEXT_MODEL", "hidden-test-model");
@@ -566,15 +576,111 @@ function setupAI(answer: any = { ok: true }) {
   );
 }
 async function clearUsage() {
-  await db.aiTask.deleteMany({ where: { ownerId: user.id } });
-  await db.aiDailyUsage.deleteMany({ where: { ownerId: user.id } });
-  await db.userAiConfig.deleteMany({ where: { ownerId: user.id } });
+  await db.aiTask.removeAll({ where: { ownerId: user.id } });
+  await db.aiDailyUsage.removeAll({ where: { ownerId: user.id } });
+  await db.userAiConfig.removeAll({ where: { ownerId: user.id } });
 }
 describe("P3 统一 AI 任务和额度", () => {
+  it("清单建议识别同名条目，出行候选不带预算、分类或购买状态", async () => {
+    const list = await save("lists", { name: "海边准备", kind: "travel" });
+    await save("shopping", {
+      listId: list.id,
+      name: "防晒霜",
+      quantity: "1 支",
+      done: true,
+    });
+    setupAI({
+      candidates: [
+        {
+          target: "shopping",
+          data: {
+            name: "防晒霜",
+            quantity: "1 支",
+            budget: 9900,
+            categoryId: "foreign-category",
+            status: "purchased",
+            done: true,
+          },
+          warnings: [],
+        },
+        {
+          target: "shopping",
+          data: {
+            name: "帽子",
+            quantity: "1 顶",
+            groupName: "防晒",
+            budget: 5000,
+          },
+          warnings: [],
+        },
+      ],
+      warnings: [],
+    });
+    const draft = await db.captureDraft.insert({
+      data: {
+        ownerId: user.id,
+        target: "shopping",
+        targetListId: list.id,
+        text: "两大一小，海边三天",
+        capturedAt: new Date(),
+      },
+    });
+    expect(await processDraft(user, draft.id)).toEqual({
+      id: draft.id,
+      count: 2,
+    });
+    const saved = await db.captureDraft.require({ where: { id: draft.id } });
+    const candidates = JSON.parse(saved.result);
+    expect(candidates[0].existingDuplicate).toBe(true);
+    expect(candidates[0].warnings.join(" ")).toContain("已有");
+    for (const candidate of candidates) {
+      expect(candidate.data.status).toBe("planned");
+      expect(candidate.data.done).toBe(false);
+      expect(candidate.data.budget).toBeUndefined();
+      expect(candidate.data.categoryId).toBeUndefined();
+    }
+  });
+  it("预览后清单新增同名条目时拒绝静默重复添加", async () => {
+    const list = await save("lists", { name: "并发清单", kind: "travel" });
+    const candidate = {
+      target: "shopping",
+      data: { name: "防晒帽", quantity: "1 顶" },
+      warnings: [],
+    };
+    const draft = await db.captureDraft.insert({
+      data: {
+        ownerId: user.id,
+        target: "shopping",
+        targetListId: list.id,
+        text: "补一顶防晒帽",
+        capturedAt: new Date(),
+        state: "ready",
+        result: JSON.stringify([candidate]),
+      },
+    });
+    await save("shopping", {
+      listId: list.id,
+      name: "防晒帽",
+      quantity: "1 顶",
+    });
+    await expect(
+      applyDraft(user, {
+        operationId: op(),
+        id: draft.id,
+        version: draft.version,
+        selections: [{ index: 0, candidate }],
+      }),
+    ).rejects.toThrow("同名条目");
+    expect(
+      await db.shoppingItem.count({
+        where: { ownerId: user.id, listId: list.id, name: "防晒帽" },
+      }),
+    ).toBe(1);
+  });
   it("并发第10和11次只有一个成功；相同任务重试不扣次，失败释放", async () => {
     setupAI();
     await clearUsage();
-    await db.aiDailyUsage.create({
+    await db.aiDailyUsage.insert({
       data: { ownerId: user.id, quotaDate: localDate(), used: 9 },
     });
     const request = (operationId: string) =>
@@ -628,7 +734,7 @@ describe("P3 统一 AI 任务和额度", () => {
     await clearUsage();
     const drafts = await Promise.all(
       Array.from({ length: 10 }, (_, i) =>
-        db.captureDraft.create({
+        db.captureDraft.insert({
           data: {
             ownerId: user.id,
             text: `午饭${i}`,
@@ -650,7 +756,7 @@ describe("P3 统一 AI 任务和额度", () => {
       operationId: taskOperationId,
     });
     expect((await aiUsage(user.id)).used).toBe(1);
-    const failed = await db.captureDraft.create({
+    const failed = await db.captureDraft.insert({
       data: { ownerId: user.id, text: "坏输入", capturedAt: new Date() },
     });
     const mock = vi.fn(async () => {
@@ -669,10 +775,10 @@ describe("P3 统一 AI 任务和额度", () => {
   it("部分草稿成功只扣一次，失败项只重试一次并保存步骤进度", async () => {
     setupAI();
     await clearUsage();
-    const good = await db.captureDraft.create({
+    const good = await db.captureDraft.insert({
       data: { ownerId: user.id, text: "成功", capturedAt: new Date() },
     });
-    const bad = await db.captureDraft.create({
+    const bad = await db.captureDraft.insert({
       data: { ownerId: user.id, text: "失败", capturedAt: new Date() },
     });
     let goodCalls = 0,
@@ -725,7 +831,7 @@ describe("P3 统一 AI 任务和额度", () => {
     expect((await aiUsage(user.id)).used).toBe(1);
     expect(
       (
-        await db.aiTask.findUniqueOrThrow({
+        await db.aiTask.require({
           where: { ownerId_operationId: { ownerId: user.id, operationId } },
         })
       ).result,
@@ -801,10 +907,10 @@ describe("P3 统一 AI 任务和额度", () => {
   it("过期执行租约释放原日期预占；迟到结果不写入不扣费", async () => {
     setupAI();
     await clearUsage();
-    await db.aiDailyUsage.create({
+    await db.aiDailyUsage.insert({
       data: { ownerId: user.id, quotaDate: "2026-11-11", reserved: 1 },
     });
-    const old = await db.aiTask.create({
+    const old = await db.aiTask.insert({
       data: {
         ownerId: user.id,
         operationId: op(),
@@ -820,7 +926,7 @@ describe("P3 统一 AI 任务和额度", () => {
     await aiUsage(user.id);
     expect(
       (
-        await db.aiDailyUsage.findUniqueOrThrow({
+        await db.aiDailyUsage.require({
           where: {
             ownerId_quotaDate: { ownerId: user.id, quotaDate: "2026-11-11" },
           },
@@ -828,16 +934,15 @@ describe("P3 统一 AI 任务和额度", () => {
       ).reserved,
     ).toBe(0);
     expect(
-      (await db.aiTask.findUniqueOrThrow({ where: { id: old.id } })).status,
+      (await db.aiTask.require({ where: { id: old.id } })).status,
     ).toBe("failed");
-    expect((await aiUsage(user.id)).remaining).toBe(10);
-    await db.aiDailyUsage.update({
+    await db.aiDailyUsage.change({
       where: {
         ownerId_quotaDate: { ownerId: user.id, quotaDate: "2026-11-11" },
       },
       data: { reserved: 1 },
     });
-    await db.aiTask.create({
+    await db.aiTask.insert({
       data: {
         ownerId: user.id,
         operationId: op(),
@@ -852,7 +957,7 @@ describe("P3 统一 AI 任务和额度", () => {
       },
     });
     await aiUsage(user.id);
-    const oldUsage = await db.aiDailyUsage.findUniqueOrThrow({
+    const oldUsage = await db.aiDailyUsage.require({
       where: {
         ownerId_quotaDate: { ownerId: user.id, quotaDate: "2026-11-11" },
       },
@@ -866,14 +971,14 @@ describe("P3 统一 AI 任务和额度", () => {
     const filter = { start: "2026-11-01", end: "2026-11-30" },
       operationId = op();
     await analyze(user, { filter, operationId, force: true });
-    const task = await db.aiTask.findUniqueOrThrow({
+    const task = await db.aiTask.require({
       where: { ownerId_operationId: { ownerId: user.id, operationId } },
     });
-    await db.aiTask.update({
+    await db.aiTask.change({
       where: { id: task.id },
       data: { quotaDate: "2026-11-11" },
     });
-    await db.aiDailyUsage.update({
+    await db.aiDailyUsage.change({
       where: {
         ownerId_quotaDate: { ownerId: user.id, quotaDate: localDate() },
       },
@@ -893,12 +998,12 @@ describe("P3 统一 AI 任务和额度", () => {
     vi.stubEnv("AI_CONFIG_ENCRYPTION_KEY", "ab".repeat(32));
     const config = await saveAiConfig(user.id, {
       enabled: false,
-      baseUrl: "https://8.8.8.8/v1",
+      baseUrl: "https://api.openai.com/v1",
       key: "private-key-never-export",
       textModel: "private-model",
       version: 0,
     });
-    const stored = await db.userAiConfig.findUniqueOrThrow({
+    const stored = await db.userAiConfig.require({
       where: { ownerId: user.id },
     });
     expect(stored.encryptedKey).not.toContain("private-key");
@@ -923,7 +1028,7 @@ describe("P3 统一 AI 任务和额度", () => {
     expect(publicAddress("8.8.8.8")).toBe(true);
     await saveAiConfig(user.id, { ...config, enabled: true });
     // Invalid configuration fails before any system fetch; no hidden fallback.
-    await db.userAiConfig.update({
+    await db.userAiConfig.change({
       where: { ownerId: user.id },
       data: { baseUrl: "https://127.0.0.1/v1" },
     });
@@ -933,7 +1038,7 @@ describe("P3 统一 AI 任务和额度", () => {
     expect(fetch).not.toHaveBeenCalled();
     expect((await aiUsage(user.id)).used).toBe(0);
     expect((await aiUsage(user.id)).providerMode).toBe("personal");
-    await db.userAiConfig.deleteMany({ where: { ownerId: user.id } });
+    await db.userAiConfig.removeAll({ where: { ownerId: user.id } });
   });
   it("分类规则优先，建议持久化，确认只改分类；旧版本和归档分类拒绝", async () => {
     await clearUsage();
@@ -941,7 +1046,7 @@ describe("P3 统一 AI 任务和额度", () => {
       name: `餐饮-${op()}`,
       type: "expense",
     });
-    await db.categoryRule.create({
+    await db.categoryRule.insert({
       data: { ownerId: user.id, keyword: "午饭", categoryId: category.id },
     });
     const entry = await save("ledger", {
@@ -963,7 +1068,7 @@ describe("P3 统一 AI 任务和额度", () => {
     expect(p.suggestions[0].categoryId).toBe(category.id);
     expect(
       (
-        await db.aiTask.findFirstOrThrow({
+        await db.aiTask.require({
           where: { ownerId: user.id, operationId: taskOperationId },
         })
       ).result,
@@ -973,7 +1078,7 @@ describe("P3 统一 AI 任务和额度", () => {
       taskOperationId,
       rows: [{ id: entry.id, categoryId: category.id }],
     });
-    const changed = await db.ledgerEntry.findUniqueOrThrow({
+    const changed = await db.ledgerEntry.require({
       where: { id: entry.id },
     });
     expect(changed.amount).toBe(entry.amount);
@@ -1001,7 +1106,7 @@ describe("P3 统一 AI 任务和额度", () => {
         rows: [{ id: entry.id, categoryId: category.id }],
       }),
     ).rejects.toThrow("归档");
-    const foreign = await db.category.create({
+    const foreign = await db.category.insert({
       data: { ownerId: other.id, name: "其他用户", type: "expense" },
     });
     await expect(
@@ -1012,33 +1117,14 @@ describe("P3 统一 AI 任务和额度", () => {
       }),
     ).rejects.toThrow("无权访问");
   });
-  it("部署明确开放的个人本地服务可调用；失败不回退且系统额度不变", async () => {
+  it("可信个人 HTTPS 服务使用 fetch；失败不回退，任意地址和重定向被拒绝", async () => {
     setupAI();
     await clearUsage();
     vi.stubEnv("AI_CONFIG_ENCRYPTION_KEY", "ab".repeat(32));
-    vi.stubEnv("AI_ALLOW_LOCAL_ENDPOINTS", "true");
-    let fail = false,
-      authorization = "";
-    const server = createServer((req, res) => {
-      authorization = req.headers.authorization || "";
-      req.resume();
-      req.on("end", () => {
-        res.writeHead(fail ? 503 : 200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            choices: [{ message: { content: '{"ok":true}' } }],
-          }),
-        );
-      });
-    });
-    await new Promise<void>((resolve) =>
-      server.listen(0, "localhost", resolve),
-    );
     try {
-      const port = (server.address() as any).port;
       await saveAiConfig(user.id, {
         enabled: true,
-        baseUrl: `http://localhost:${port}/v1`,
+        baseUrl: "https://api.openai.com/v1",
         textModel: "local-test",
         key: "personal-local-key",
         version: 0,
@@ -1048,19 +1134,51 @@ describe("P3 统一 AI 任务和额度", () => {
           callAI("test", "test"),
         ),
       ).toEqual({ ok: true });
-      expect(authorization).toBe("Bearer personal-local-key");
-      expect(fetch).not.toHaveBeenCalled();
-      fail = true;
+      expect(fetch).toHaveBeenCalledWith("https://api.openai.com/v1/chat/completions",
+        expect.objectContaining({ redirect: "manual", headers: expect.objectContaining({ Authorization: "Bearer personal-local-key" }) }));
+      vi.mocked(fetch).mockResolvedValue(new Response("unavailable", { status: 503 }));
       await expect(
         runAiTask(user.id, "personal-test", op(), {}, () =>
           callAI("test", "test"),
         ),
       ).rejects.toThrow("503");
-      expect(fetch).not.toHaveBeenCalled();
       expect((await aiUsage(user.id)).used).toBe(0);
+      vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 302, headers: { Location: "https://untrusted.example" } }));
+      await expect(runAiTask(user.id, "personal-test", op(), {}, () => callAI("test", "test"))).rejects.toThrow("不允许重定向");
+      await expect(saveAiConfig(user.id, {
+        enabled: true, baseUrl: "https://untrusted.example/v1", textModel: "model", version: 1,
+      })).rejects.toThrow("可信");
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await db.userAiConfig.deleteMany({ where: { ownerId: user.id } });
+      await db.userAiConfig.removeAll({ where: { ownerId: user.id } });
     }
+  });
+  it("管家对话：带数据快照与历史，AI 回复解析为自然语言并扣 1 次", async () => {
+    await clearUsage();
+    setupAI({ reply: "你好呀，我是小数管家。想查这周花了多少，还是记一笔？", needsCapture: false });
+    const result = await chat(user, {
+      question: "你好",
+      history: [{ role: "user", text: "你好" }],
+      page: "dashboard",
+      listName: "",
+      operationId: op(),
+    });
+    expect(result.reply).toContain("小数管家");
+    expect(result.needsCapture).toBe(false);
+    expect((await aiUsage(user.id)).used).toBe(1);
+
+    setupAI({
+      reply: "你想记一笔，可以说「昨天买了背包花了199元」。",
+      needsCapture: true,
+    });
+    const result2 = await chat(user, {
+      question: "我想记一笔",
+      history: [],
+      page: "dashboard",
+      listName: "",
+      operationId: op(),
+    });
+    expect(result2.needsCapture).toBe(true);
+    expect((await aiUsage(user.id)).used).toBe(2);
+    await clearUsage();
   });
 });

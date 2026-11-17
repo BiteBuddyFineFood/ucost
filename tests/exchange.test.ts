@@ -19,10 +19,11 @@ import {
   entities,
   models,
 } from "../src/server/exchange-codec";
+import { addDays } from "../src/lib/period";
 const users: any[] = [];
 const op = () => randomUUID();
 async function user() {
-  const u = await db.user.create({
+  const u = await db.user.insert({
     data: { username: `p4-${op()}`, passwordHash: "test" },
   });
   users.push(u);
@@ -103,7 +104,7 @@ beforeAll(async () => {
     refundOfId: expense.id,
     accountId: null,
   });
-  const draft = await db.captureDraft.create({
+  const draft = await db.captureDraft.insert({
     data: {
       ownerId: source.id,
       text: "图片未完成任务",
@@ -115,7 +116,7 @@ beforeAll(async () => {
       leaseAt: new Date(),
     },
   });
-  await db.attachment.create({
+  await db.attachment.insert({
     data: {
       ownerId: source.id,
       draftId: draft.id,
@@ -130,11 +131,11 @@ beforeAll(async () => {
 });
 afterAll(async () => {
   for (const u of users) {
-    await db.reviewVote.deleteMany({
+    await db.reviewVote.removeAll({
       where: {
         reviewId: {
           in: (
-            await db.reviewRequest.findMany({ where: { ownerId: u.id } })
+            await db.reviewRequest.list({ where: { ownerId: u.id } })
           ).map((r) => r.id),
         },
       },
@@ -146,10 +147,10 @@ afterAll(async () => {
       "exchangeDataset",
       "appliedOperation",
     ])
-      await (db as any)[m].deleteMany({ where: { ownerId: u.id } });
-    await db.user.delete({ where: { id: u.id } });
+      await (db as any)[m].removeAll({ where: { ownerId: u.id } });
+    await db.user.remove({ where: { id: u.id } });
   }
-  await db.$disconnect();
+
 });
 describe("P4 data exchange", () => {
   it("JSON v2 往返保留金额、分组、预算结算、退款和来源；重复任务/文件不重复入账", async () => {
@@ -184,7 +185,8 @@ describe("P4 data exchange", () => {
         .supersededBySettlementId,
     ).toBe(restored.settlements[0].id);
     expect(JSON.parse(restored.settlements[0].members)[0].id).toBe(i.id);
-    expect(restored.drafts[0].state).toBe("pending");
+    expect(restored.drafts[0].state).toBe("failed");
+    expect(restored.drafts[0].error).toContain("重新选择截图");
     expect(restored.drafts[0].leaseId).toBeNull();
     expect(restored.attachments[0].missing).toBe(true);
     const again = await previewImport(target, {
@@ -273,7 +275,7 @@ describe("P4 data exchange", () => {
       out.shopping.find((r: any) => r.name === "无账单").purchaseNeedsReview,
     ).toBe(true);
     const a = await save(u, "accounts", { name: "默认账户" });
-    await db.user.update({
+    await db.user.change({
       where: { id: u.id },
       data: { defaultExpenseAccountId: a.id },
     });
@@ -358,18 +360,18 @@ describe("P4 data exchange", () => {
     const dup = structuredClone(data);
     dup.ledger.push(dup.ledger[0]);
     expect(() => decodeFile(JSON.stringify(dup))).toThrow("源 ID 重复");
-    expect(() => decodeFile("x".repeat(8_000_001))).toThrow("8MB");
+    expect(() => decodeFile("x".repeat(500_001))).toThrow("500KB");
     const tooMany = {
       schemaVersion: 2,
       datasetId: "oversize",
       currency: "CNY",
       amountUnit: "cent",
-      accounts: Array.from({ length: 10001 }, (_, i) => ({
+      accounts: Array.from({ length: 301 }, (_, i) => ({
         id: String(i),
         name: "A",
       })),
     };
-    expect(() => decodeFile(JSON.stringify(tooMany))).toThrow("10000");
+    expect(() => decodeFile(JSON.stringify(tooMany))).toThrow("300");
     expect(() => decodeFile(JSON.stringify({ schemaVersion: 1 }))).toThrow(
       "来源标识",
     );
@@ -444,10 +446,10 @@ describe("P4 data exchange", () => {
       commitImport(u, { jobId: p.jobId }),
     ]);
     expect(a).toEqual(b);
-    const entry = await db.ledgerEntry.findFirstOrThrow({
+    const entry = await db.ledgerEntry.require({
       where: { ownerId: u.id, type: "income" },
     });
-    await db.ledgerEntry.update({
+    await db.ledgerEntry.change({
       where: { id: entry.id },
       data: { note: "本地手动修改", version: { increment: 1 } },
     });
@@ -597,5 +599,81 @@ describe("P4 data exchange", () => {
       ),
     ).toBe(true);
     expect(legacy.records.ledger[0].sourceShoppingItemId).toBeNull();
+  });
+  it("导出恢复保留收纳箱、物品用途、来源快照和提醒处理状态", async () => {
+    const u = await user(),
+      destination = await user();
+    const box = await save(u, "boxes", {
+      name: "冬衣箱",
+      location: "卧室衣柜",
+      note: "换季",
+      color: "#6F7F63",
+    });
+    const item = await save(u, "items", {
+      name: "羽绒服",
+      quantity: 2,
+      unit: "件",
+      storageEnabled: true,
+      boxId: box.id,
+      expiryEnabled: true,
+      expiresOn: addDays(new Date().toISOString().slice(0, 10), 20),
+      costEnabled: false,
+      sourceNote: "2026-11-13 · 手工登记",
+      note: "干洗后收纳",
+    });
+    const rule = await action(u, {
+      action: "reminderSave",
+      targetType: "item",
+      targetId: item.id,
+      triggerType: "fixed",
+      fixedAt: new Date(Date.now() - 60_000).toISOString(),
+      timezone: "Asia/Shanghai",
+    });
+    const checked = await action(u, { action: "reminderCheck" });
+    const occurrence = checked.reminders.find(
+      (row: any) => row.ruleId === rule.id,
+    );
+    expect(occurrence).toBeTruthy();
+    await action(u, {
+      action: "reminderHandle",
+      id: occurrence.id,
+      mode: "done",
+    });
+    const exported = await exportData(u);
+    const preview = await previewImport(destination, {
+      content: JSON.stringify(exported),
+    });
+    expect(preview.errors).toEqual([]);
+    expect(preview.unresolved).toEqual([]);
+    expect(preview.canCommit).toBe(true);
+    await commitImport(destination, { jobId: preview.jobId });
+    const restored = await exportData(destination);
+    const restoredBox = restored.boxes[0];
+    const restoredItem = restored.items.find(
+      (row: any) => row.name === "羽绒服",
+    );
+    expect(restoredBox).toMatchObject({
+      name: "冬衣箱",
+      location: "卧室衣柜",
+      color: "#6F7F63",
+    });
+    expect(restoredItem).toMatchObject({
+      quantity: 2,
+      unit: "件",
+      storageEnabled: true,
+      expiryEnabled: true,
+      costEnabled: false,
+      sourceNote: "2026-11-13 · 手工登记",
+      boxId: restoredBox.id,
+    });
+    const restoredRule = restored.reminders.find(
+      (row: any) => row.targetId === restoredItem.id,
+    );
+    expect(restoredRule?.targetType).toBe("item");
+    const restoredOccurrence = restored.reminderEvents.find(
+      (row: any) => row.ruleId === restoredRule.id,
+    );
+    expect(restoredOccurrence?.state).toBe("done");
+    expect(restoredOccurrence?.handledAt).toBeTruthy();
   });
 });

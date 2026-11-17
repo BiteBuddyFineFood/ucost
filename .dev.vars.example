@@ -1,0 +1,12 @@
+# Copy to .dev.vars. Local preview never loads the legacy .env.
+# No AI call is needed for manual bookkeeping or the deterministic test suite.
+APP_URL=http://localhost:8787
+AI_ALLOWED_ORIGINS=https://api.openai.com,https://api.deepseek.com
+AI_BASE_URL=
+AI_API_KEY=
+AI_TEXT_MODEL=
+AI_VISION_MODEL=
+# 未绑定邀请码的账号禁止使用 AI（默认 true）。自托管调试可临时设为 false。
+AI_REQUIRE_INVITE=true
+# AES-256-GCM: 32 random bytes encoded as 64 hex characters. Keep privately.
+AI_CONFIG_ENCRYPTION_KEY=

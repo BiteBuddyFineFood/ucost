@@ -1,7 +1,22 @@
 "use client";
 import { AiStatus } from "./enhancements";
-import { useRef, useState } from "react";
-import { Mic, ImagePlus, Sparkles, Check, Clock3 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  Bell,
+  Box,
+  Check,
+  Clock3,
+  ChevronDown,
+  ImagePlus,
+  ListChecks,
+  Luggage,
+  Mic,
+  PiggyBank,
+  RefreshCw,
+  ShoppingBasket,
+  Sparkles,
+  Wallet,
+} from "lucide-react";
 import {
   api,
   Busy,
@@ -13,16 +28,112 @@ import {
 } from "./ui";
 import { draftStates, draftTargetLabels } from "@/lib/domain";
 
+const captureModes = [
+  {
+    key: "auto",
+    label: "自动判断",
+    hint: "一段话几件事",
+    icon: Sparkles,
+  },
+  { key: "ledger", label: "账本", hint: "收支、退款、转账", icon: Wallet },
+  {
+    key: "shopping",
+    label: "购物清单",
+    hint: "要买的东西",
+    icon: ShoppingBasket,
+  },
+  {
+    key: "conversion",
+    label: "买到 / 不买了",
+    hint: "结算已有清单条目",
+    icon: Check,
+  },
+  { key: "travel", label: "出行准备", hint: "按类别带什么", icon: Luggage },
+  { key: "normal", label: "日常清单", hint: "要做、要准备", icon: ListChecks },
+  { key: "items", label: "登记物品", hint: "位置、数量、保质期", icon: Box },
+  {
+    key: "itemUpdate",
+    label: "物品变动",
+    hint: "还剩、挪位置、改日期",
+    icon: RefreshCw,
+  },
+  { key: "reminder", label: "到期提醒", hint: "提前几天提醒", icon: Bell },
+  { key: "savings", label: "省钱罐", hint: "优惠、没买、降级", icon: PiggyBank },
+] as const;
+
+type CaptureMode = (typeof captureModes)[number]["key"];
+
+function initialCaptureMode(target: string, listId: string | undefined, lists: any[]) {
+  if (
+    ["auto", "ledger", "items", "itemUpdate", "reminder", "savings"].includes(
+      target,
+    )
+  )
+    return target as CaptureMode;
+  if (target === "shopping") {
+    const list = lists.find((item: any) => item.id === listId);
+    if (list?.kind === "travel") return "travel" as CaptureMode;
+    if (list?.kind === "normal") return "normal" as CaptureMode;
+    return "shopping" as CaptureMode;
+  }
+  return "auto" as CaptureMode;
+}
+
+function modeListKind(mode: CaptureMode) {
+  if (mode === "travel") return "travel";
+  if (mode === "normal") return "normal";
+  if (mode === "shopping") return "shopping";
+  return null;
+}
+
+function captureModeTitle(mode: CaptureMode) {
+  if (mode === "auto") return "一句话，理清楚";
+  if (mode === "ledger") return "记一笔，先核对再入账";
+  if (mode === "shopping") return "说说清单里要加什么";
+  if (mode === "conversion") return "清单里那件，买到了还是不买了";
+  if (mode === "travel") return "说说这趟出行，AI 帮你列准备";
+  if (mode === "normal") return "说说日常清单要准备什么";
+  if (mode === "items") return "登记物品，不必先有账单";
+  if (mode === "itemUpdate") return "物品变了什么，先列出前后值";
+  if (mode === "reminder") return "设一个网页内到期提醒";
+  return "省下的，也值得记";
+}
+
+function captureModePlaceholder(mode: CaptureMode) {
+  if (mode === "auto")
+    return "今天花 36 元买了 6 盒牛奶，放冰箱，12 月 1 日到期，提前一天提醒我。也可以一次写几件不同的事……";
+  if (mode === "ledger")
+    return "午饭 28；工资到账八千；买猫粮应付 100，用券 20，实付 80……";
+  if (mode === "shopping")
+    return "牛奶两盒，鸡蛋一打。洗衣液无香的，预算五十以内……";
+  if (mode === "conversion")
+    return "清单里的充电线买到了，实付 39；洗衣液不买了，原预算 49……";
+  if (mode === "travel")
+    return "两大一小，海边三天，想轻装。防晒、常用药和证件别忘……";
+  if (mode === "normal")
+    return "周末大扫除要准备什么，按清洁工具、耗材和要扔的东西分组……";
+  if (mode === "items")
+    return "护照放书房第二个抽屉；新买的充电线 3 根，放床头柜……";
+  if (mode === "itemUpdate")
+    return "冰箱牛奶还剩 2 盒；护照改到卧室床头柜；冬衣箱移到储物间……";
+  if (mode === "reminder")
+    return "牛奶 12 月 1 日到期，提前一天提醒我；护照到期前 30 天提醒……";
+  return "洗衣液原价 69，降级买了 45 的；本来想买新杯子，后来没买，省了 39……";
+}
+
 export function Capture({
   state,
   target = "ledger",
   listId,
+  initialText = "",
   close,
   refresh,
   notify,
 }: any) {
-  const [text, setText] = useState(""),
-    [mode, setMode] = useState(target),
+  const [text, setText] = useState<string>(String(initialText || "")),
+    [mode, setMode] = useState<CaptureMode>(() =>
+      initialCaptureMode(target, listId, state.lists),
+    ),
     [selectedList, setSelectedList] = useState(
       listId || state.lists.find((l: any) => !l.archived)?.id || "",
     ),
@@ -30,26 +141,53 @@ export function Capture({
     [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
     [recording, setRecording] = useState(false);
-  const capturedAt = useRef<string | null>(null),
+  const capturedAt = useRef<string | null>(
+      initialText ? new Date().toISOString() : null,
+    ),
     recognizer = useRef<any>(null);
+  const selectedListRecord = state.lists.find(
+    (list: any) => list.id === selectedList,
+  );
+  const listMode = modeListKind(mode);
+  const requestTarget =
+    listMode ? "shopping" : mode === "conversion" ? "auto" : mode;
   const captureId = useRef<string | null>(null);
+  const voiceInput = useRef(false);
   const [review, setReview] = useState<any>(null);
+
+  function chooseMode(next: CaptureMode) {
+    setMode(next);
+    const kind = modeListKind(next);
+    if (!kind) return;
+    const currentKind = selectedListRecord?.kind || "shopping";
+    if (currentKind === kind) return;
+    const match = state.lists.find(
+      (list: any) => !list.archived && (list.kind || "shopping") === kind,
+    );
+    setSelectedList(match?.id || "");
+  }
+
   async function save(process: boolean) {
     setBusy(true);
     setError("");
     try {
+      if (listMode && !selectedList)
+        throw new Error("请先选择目标清单，或切换成自动判断");
+      if (!text.trim() && !files.length)
+        throw new Error("先写一句要记录的内容");
       const form = new FormData();
       captureId.current ||= crypto.randomUUID();
       form.set("captureId", captureId.current);
       form.set("text", text);
-      form.set("target", mode);
-      form.set("capturedAt", capturedAt.current || new Date().toISOString());
+      form.set("target", requestTarget);
+      capturedAt.current ||= new Date().toISOString();
+      form.set("capturedAt", capturedAt.current);
       form.set("timezone", state.user.timezone);
       form.set(
         "inputMethod",
-        capturedAt.current ? "voice" : files.length ? "image" : "text",
+        files.length ? "image" : voiceInput.current ? "voice" : "text",
       );
-      if (mode === "shopping") form.set("targetListId", selectedList);
+      if (listMode && selectedList) form.set("targetListId", selectedList);
       files.forEach((f) => form.append("images", f));
       const response = await fetch("/api/capture", {
         method: "POST",
@@ -57,11 +195,12 @@ export function Capture({
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error);
-      if (process) await api("process", { ids: [data.draft.id] });
+      if (process && !data.recognized) await api("process", { ids: [data.draft.id] });
       else if (data.shouldProcess) {
         let remaining: string[] | undefined;
+        const operationId = crypto.randomUUID();
         do {
-          const result = await api("process", { ids: remaining || [] });
+          const result = await api("process", { ids: remaining || [], operationId });
           remaining = result.remaining;
         } while (remaining?.length);
       }
@@ -113,6 +252,7 @@ export function Capture({
     };
     recognition.onend = () => setRecording(false);
     capturedAt.current ||= new Date().toISOString();
+    voiceInput.current = true;
     setRecording(true);
     setError("");
     recognition.start();
@@ -129,40 +269,75 @@ export function Capture({
     );
   return (
     <Modal
-      title={mode === "shopping" ? "说说清单里要加什么" : "先记下来，慢慢整理"}
+      title={captureModeTitle(mode)}
       close={() => {
         recognizer.current?.stop();
         close();
       }}
     >
-      <div className="capture-target">
-        <label>
-          整理到
-          <select value={mode} onChange={(e) => setMode(e.target.value)}>
-            <option value="auto">自动判断模块</option>
-            <option value="ledger">账本</option>
-            <option value="shopping">购物清单</option>
-            <option value="items">物品档案</option>
-            <option value="savings">省钱罐</option>
-          </select>
-        </label>
-        {mode === "shopping" && (
-          <label>
-            目标清单
+      <div className="capture-mode-block">
+        <div className="capture-mode-heading">
+          <div>
+            <b>这次要记什么</b>
+            <small>选具体模块只保留该模块候选；不确定就用自动判断。</small>
+          </div>
+          <span className="pill">
+            {mode === "conversion"
+              ? "购买决定"
+              : draftTargetLabels[requestTarget] || "自动判断"}
+          </span>
+        </div>
+        <div className="capture-modes" role="group" aria-label="快速记录类型">
+          {captureModes.map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                key={item.key}
+                type="button"
+                className={`capture-mode ${
+                  mode === item.key ? "selected" : ""
+                }`}
+                onClick={() => chooseMode(item.key)}
+                aria-pressed={mode === item.key}
+              >
+                <span className="capture-mode-icon" aria-hidden="true">
+                  <Icon size={16} strokeWidth={1.7} />
+                </span>
+                <span>
+                  <b>{item.label}</b>
+                  <small>{item.hint}</small>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        {listMode && (
+          <label className="capture-list-choice">
+            <span>放进哪份清单</span>
             <select
               disabled={!!listId}
               value={selectedList}
               onChange={(e) => setSelectedList(e.target.value)}
             >
+              <option value="">请选择清单</option>
               {state.lists
-                .filter((l: any) => !l.archived)
-                .map((l: any) => (
-                  <option key={l.id} value={l.id}>
-                    {l.name}
+                .filter(
+                  (list: any) =>
+                    !list.archived &&
+                    (list.kind || "shopping") === listMode,
+                )
+                .map((list: any) => (
+                  <option key={list.id} value={list.id}>
+                    {list.name}
                   </option>
                 ))}
             </select>
           </label>
+        )}
+        {listMode && !selectedList && (
+          <p className="capture-mode-warning">
+            这个类型还没有可用清单。请先到清单页新建，或切换成购物清单。
+          </p>
         )}
       </div>
       <textarea
@@ -170,18 +345,18 @@ export function Capture({
         rows={6}
         autoFocus
         value={text}
-        onChange={(e) => setText(e.target.value)}
-        placeholder={
-          mode === "shopping"
-            ? "牛奶两盒，鸡蛋一打。洗衣液无香的，预算五十以内……"
-            : "今天工资到账八千，午饭二十八。买的猫粮应付一百，用券二十，实付八十……"
-        }
+        onChange={(e) => {
+          capturedAt.current ||= new Date().toISOString();
+          captureId.current = null;
+          setText(e.target.value);
+        }}
+        placeholder={captureModePlaceholder(mode)}
         onPaste={(e) => {
           const images = Array.from(e.clipboardData.files).filter((f) =>
             f.type.startsWith("image/"),
           );
           if (images.length)
-            setFiles((prev) => [...prev, ...images].slice(0, 3));
+            { capturedAt.current ||= new Date().toISOString(); setFiles((prev) => [...prev, ...images].slice(0, 3)); }
         }}
       />
       <div className="capture-tools">
@@ -200,11 +375,12 @@ export function Capture({
             type="file"
             accept="image/png,image/jpeg,image/webp"
             multiple
-            onChange={(e) =>
+            onChange={(e) => {
+              capturedAt.current ||= new Date().toISOString();
               setFiles((prev) =>
                 [...prev, ...Array.from(e.target.files || [])].slice(0, 3),
-              )
-            }
+              );
+            }}
           />
         </label>
         <small>也可以直接粘贴截图</small>
@@ -224,6 +400,7 @@ export function Capture({
         <Clock3 size={14} />{" "}
         保存时记录这一条的时间。晚几天整理，“今天”仍按记录当天理解。
       </p>
+      {files.length > 0 && <p className="hint">截图仅在本次请求识别，不保存原图。失败可在本页重试；刷新或关闭后需重新选择。截图会发送给已配置的识别服务。</p>}
       <AiStatus ai={state.ai} />
       {!state.ai.configured && (
         <p className="hint">AI 尚未配置，可以先保存内容。</p>
@@ -232,7 +409,12 @@ export function Capture({
       <footer>
         <button
           className="button secondary"
-          disabled={busy || recording}
+          disabled={
+            busy ||
+            recording ||
+            files.length > 0 ||
+            (!!listMode && !selectedList)
+          }
           onClick={() => save(false)}
         >
           {busy ? <Busy /> : "先存着"}
@@ -242,16 +424,111 @@ export function Capture({
           disabled={
             busy ||
             recording ||
+            (!!listMode && !selectedList) ||
             !state.ai.configured ||
-            (state.ai.providerMode === "system" && !state.ai.remaining)
+            !state.ai.allowed
           }
           onClick={() => save(true)}
         >
           <Sparkles size={16} />
-          {busy ? "保存与整理中…" : "保存并整理"}
+          {busy ? "保存与整理中…" : files.length ? "识别截图并保存结果" : "保存并整理"}
         </button>
       </footer>
     </Modal>
+  );
+}
+
+function FilterMenu({
+  open,
+  onToggle,
+  label,
+  value,
+  options,
+  counts,
+  onChange,
+  ariaLabel,
+  align = "left",
+}: {
+  open: boolean;
+  onToggle: () => void;
+  label: string;
+  value: string;
+  options: [string, string][];
+  counts?: Record<string, number>;
+  onChange: (value: string) => void;
+  ariaLabel: string;
+  align?: "left" | "right";
+}) {
+  const current = options.find(([key]) => key === value)?.[1] || label;
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    function onPointerDown(event: PointerEvent) {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        onToggle();
+      }
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onToggle();
+    }
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open, onToggle]);
+  return (
+    <div
+      className={`filter-menu filter-menu-${align}`}
+      ref={rootRef}
+    >
+      <button
+        className={`filter-menu-trigger${open ? " open" : ""}`}
+        aria-label={ariaLabel}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        onClick={onToggle}
+      >
+        <span className="filter-menu-label">{label}</span>
+        <span className="filter-menu-value">{current}</span>
+        <ChevronDown
+          className="filter-menu-chevron"
+          size={14}
+          strokeWidth={2}
+          aria-hidden="true"
+        />
+      </button>
+      {open && (
+        <div className="filter-menu-pop" role="listbox" aria-label={ariaLabel}>
+          {options.map(([key, optionLabel]) => {
+            const count = counts?.[key] ?? 0;
+            return (
+              <button
+                key={key}
+                role="option"
+                aria-selected={value === key}
+                className={`filter-menu-option${
+                  value === key ? " selected" : ""
+                }`}
+                onClick={() => {
+                  onChange(key);
+                  onToggle();
+                }}
+              >
+                <span className="filter-menu-check">
+                  {value === key && (
+                    <Check size={13} strokeWidth={2.5} aria-hidden="true" />
+                  )}
+                </span>
+                <span className="filter-menu-option-label">{optionLabel}</span>
+                {count > 0 && <b className="filter-menu-count">{count}</b>}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -269,6 +546,7 @@ export function DraftInbox({
     [targetFilter, setTargetFilter] = useState("all"),
     [listFilter, setListFilter] = useState("all"),
     [stateFilter, setStateFilter] = useState("active");
+  const [openMenu, setOpenMenu] = useState<string | null>(null);
   const activeDrafts = state.drafts.filter((d: any) =>
     ["pending", "processing", "ready", "failed"].includes(d.state),
   );
@@ -294,6 +572,8 @@ export function DraftInbox({
     ["ledger", "账本"],
     ["shopping", "购物清单"],
     ["items", "物品"],
+    ["itemUpdate", "物品更新"],
+    ["reminder", "提醒"],
     ["savings", "省钱罐"],
     ["text", "普通备忘"],
   ];
@@ -307,9 +587,14 @@ export function DraftInbox({
       do {
         const chunk = queue.slice(0, 10);
         const rest = queue.slice(10);
-        const result = await api("process", { ids: chunk, retry });
-        queue = [...result.remaining, ...rest];
-        await refresh();
+        let remaining = chunk;
+        const operationId = crypto.randomUUID();
+        do {
+          const result = await api("process", { ids: remaining, retry, operationId });
+          remaining = result.remaining;
+          await refresh();
+        } while (remaining.length);
+        queue = rest;
       } while (queue.length);
       notify("整理已结束，请检查结果与失败提示");
     } catch (e) {
@@ -331,7 +616,7 @@ export function DraftInbox({
             busy ||
             (!chosen.length && !processable.length) ||
             !state.ai.configured ||
-            (state.ai.providerMode === "system" && !state.ai.remaining)
+            !state.ai.allowed
           }
           onClick={() =>
             process(
@@ -366,32 +651,59 @@ export function DraftInbox({
         })}
       </div>
       <div className="filter-bar draft-filters">
-        <select
-          aria-label="草稿状态筛选"
+        <FilterMenu
+          open={openMenu === "state"}
+          onToggle={() =>
+            setOpenMenu(openMenu === "state" ? null : "state")
+          }
+          label="状态"
           value={stateFilter}
-          onChange={(event) => setStateFilter(event.target.value)}
-        >
-          <option value="active">待处理</option>
-          <option value="all">全部状态</option>
-          <option value="pending">未整理</option>
-          <option value="processing">整理中</option>
-          <option value="ready">待确认</option>
-          <option value="failed">失败</option>
-          <option value="applied">已应用</option>
-          <option value="ignored">已忽略</option>
-        </select>
-        <select
-          aria-label="目标清单筛选"
+          options={[
+            ["active", "待处理"],
+            ["all", "全部状态"],
+            ["pending", "未整理"],
+            ["processing", "整理中"],
+            ["ready", "待确认"],
+            ["failed", "失败"],
+            ["applied", "已应用"],
+            ["ignored", "已忽略"],
+          ]}
+          counts={(() => {
+            const map: Record<string, number> = {
+              active: activeDrafts.length,
+            };
+            state.drafts.forEach((d: any) => {
+              map[d.state] = (map[d.state] || 0) + 1;
+            });
+            return map;
+          })()}
+          onChange={setStateFilter}
+          ariaLabel="草稿状态筛选"
+        />
+        <FilterMenu
+          open={openMenu === "list"}
+          onToggle={() => setOpenMenu(openMenu === "list" ? null : "list")}
+          label="清单"
           value={listFilter}
-          onChange={(event) => setListFilter(event.target.value)}
-        >
-          <option value="all">全部清单</option>
-          {state.lists.map((list: any) => (
-            <option key={list.id} value={list.id}>
-              {list.name}
-            </option>
-          ))}
-        </select>
+          options={[
+            ["all", "全部清单"],
+            ...state.lists.map((list: any) => [list.id, list.name]),
+          ]}
+          counts={(() => {
+            const map: Record<string, number> = {
+              all: state.drafts.length,
+            };
+            state.drafts.forEach((d: any) => {
+              if (d.targetListId) {
+                map[d.targetListId] = (map[d.targetListId] || 0) + 1;
+              }
+            });
+            return map;
+          })()}
+          onChange={setListFilter}
+          ariaLabel="目标清单筛选"
+          align="right"
+        />
         <span className="hint">
           当前筛选 {filtered.length}{" "}
           条；批量整理只处理当前筛选或明确勾选的范围。
@@ -681,6 +993,8 @@ function DraftCard({
                 <option value="ledger">账本</option>
                 <option value="shopping">购物清单</option>
                 <option value="items">物品档案</option>
+                <option value="itemUpdate">物品更新</option>
+                <option value="reminder">到期提醒</option>
                 <option value="savings">省钱罐</option>
                 <option value="text">普通备忘</option>
               </select>
@@ -866,8 +1180,12 @@ export function DraftSection({
   notify,
   target,
   listId = null,
+  foldOpen,
+  onFoldChange,
 }: any) {
-  const [open, setOpen] = useState(true);
+  const [localOpen, setLocalOpen] = useState(false);
+  const open = foldOpen ?? localOpen;
+  const setOpen = onFoldChange ?? setLocalOpen;
   const drafts = state.drafts.filter(
     (draft: any) =>
       draft.target === target &&
@@ -876,6 +1194,10 @@ export function DraftSection({
   );
   if (!drafts.length) return null;
   const ready = drafts.filter((draft: any) => draft.state === "ready").length;
+  const failed = drafts.filter((draft: any) => draft.state === "failed").length;
+  const pending = drafts.filter(
+    (draft: any) => draft.state === "pending",
+  ).length;
   return (
     <details
       className="draft-section"
@@ -885,7 +1207,9 @@ export function DraftSection({
       <summary>
         <Clock3 size={15} />
         本页暂存 <b>{drafts.length}</b> 条
+        {failed > 0 && <span className="pill red">{failed} 条失败</span>}
         {ready > 0 && <span className="pill">{ready} 条待确认</span>}
+        {pending > 0 && <span className="pill">{pending} 条待整理</span>}
       </summary>
       <div className="draft-section-list">
         {drafts.map((draft: any) => (
@@ -916,7 +1240,9 @@ function DraftReview({ draft, state, close, refresh, notify }: any) {
         .map((_, i) => i)
         .filter(
           (i) =>
-            !applied.includes(i) && candidates[i].duplicateOf === undefined,
+            !applied.includes(i) &&
+            candidates[i].duplicateOf === undefined &&
+            !candidates[i].existingDuplicate,
         ),
     ),
     [busy, setBusy] = useState(false),
@@ -991,6 +1317,13 @@ function DraftReview({ draft, state, close, refresh, notify }: any) {
                                             (s: any) => s.id === v,
                                           )?.version,
                                         }
+                                      : c.target === "itemUpdate" &&
+                                          field.key === "itemId"
+                                        ? {
+                                            itemVersion: state.items.find(
+                                              (item: any) => item.id === v,
+                                            )?.version,
+                                          }
                                       : {}),
                                   },
                                 }

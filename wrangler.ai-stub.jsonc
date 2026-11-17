@@ -1,0 +1,5 @@
+{
+  "name": "ucost-ai-stub",
+  "main": "tests/ai-stub-worker.mjs",
+  "compatibility_date": "2026-10-13"
+}

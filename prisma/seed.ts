@@ -1,4 +1,3 @@
-import "dotenv/config";
 import { db } from "../src/server/db";
 import { register } from "../src/server/auth";
 import { localDate } from "../src/lib/domain";
@@ -10,10 +9,10 @@ async function main() {
   if (!demoPassword)
     throw new Error("请设置 SEED_PASSWORD 环境变量后再运行 db:seed");
   for (const username of ["demo", "reviewer1", "reviewer2"]) {
-    if (!(await db.user.findUnique({ where: { username } })))
+    if (!(await db.user.first({ where: { username } })))
       await register(username, demoPassword);
   }
-  const user = await db.user.findUniqueOrThrow({ where: { username: "demo" } });
+  const user = await db.user.require({ where: { username: "demo" } });
   if (await db.ledgerEntry.count({ where: { ownerId: user.id } })) {
     console.log("演示账号已有数据，跳过重复填充。");
     return;
@@ -21,11 +20,11 @@ async function main() {
   const ownerId = user.id,
     today = localDate(),
     month = today.slice(0, 7);
-  const categories = await db.category.findMany({ where: { ownerId } });
-  const account = await db.account.findFirstOrThrow({
+  const categories = await db.category.list({ where: { ownerId } });
+  const account = await db.account.require({
     where: { ownerId, name: "银行卡" },
   });
-  const list = await db.shoppingList.findFirstOrThrow({ where: { ownerId } });
+  const list = await db.shoppingList.require({ where: { ownerId } });
   const rows = [
     {
       title: "十一月工资（演示）",
@@ -71,7 +70,7 @@ async function main() {
     },
   ];
   for (const row of rows)
-    await db.ledgerEntry.create({
+    await db.ledgerEntry.insert({
       data: {
         ownerId,
         title: row.title,
@@ -82,7 +81,7 @@ async function main() {
         categoryId: categories.find((c) => c.name === row.category)?.id,
       },
     });
-  await db.shoppingItem.createMany({
+  await db.shoppingItem.insertAll({
     data: [
       {
         ownerId,
@@ -104,14 +103,14 @@ async function main() {
       },
     ],
   });
-  await db.shoppingList.create({
+  await db.shoppingList.insert({
     data: {
       ownerId,
       name: "给家的小更新（演示）",
       description: "不着急，慢慢选。",
     },
   });
-  await db.ownedItem.create({
+  await db.ownedItem.insert({
     data: {
       ownerId,
       name: "降噪耳机（演示）",
@@ -120,7 +119,7 @@ async function main() {
       note: "上下班路上的好伙伴",
     },
   });
-  await db.savingEntry.createMany({
+  await db.savingEntry.insertAll({
     data: [
       {
         ownerId,
@@ -145,12 +144,12 @@ async function main() {
     ],
   });
   console.log(
-    "已创建明确标记的演示数据。账号 demo / reviewer1 / reviewer2，密码见 README。",
+    "已创建明确标记的演示数据。账号 demo / reviewer1 / reviewer2，密码使用本次 SEED_PASSWORD。",
   );
 }
-main()
+export const seed = main()
   .catch((e) => {
     console.error(e instanceof Error ? e.message : "seed失败");
     process.exitCode = 1;
   })
-  .finally(() => db.$disconnect());
+  .finally(() => Promise.resolve());

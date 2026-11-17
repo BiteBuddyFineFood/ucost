@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { randomUUID } from "node:crypto";
+import { openMobileActions } from "./navigation-helpers";
 const testPassword = process.env.E2E_TEST_PASSWORD ?? `Test-${randomUUID()}!`;
 const demoPassword = process.env.SEED_PASSWORD;
 test("桌面真实记账、批量编辑与首页布局持久化", async ({ page }) => {
@@ -56,7 +57,6 @@ test("演示账本 PC 与手机布局无横向溢出", async ({ page }) => {
     page.getByRole("heading", { name: "日常，慢慢有数。" }),
   ).toBeVisible();
   await page.screenshot({
-    path: "docs/screenshots/dashboard-desktop.png",
     fullPage: true,
   });
   expect(
@@ -66,7 +66,6 @@ test("演示账本 PC 与手机布局无横向溢出", async ({ page }) => {
   ).toBe(true);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({
-    path: "docs/screenshots/dashboard-mobile.png",
     fullPage: true,
   });
   expect(
@@ -79,11 +78,11 @@ test("演示账本 PC 与手机布局无横向溢出", async ({ page }) => {
     .getByRole("button", { name: "购物清单" })
     .click();
   await page.getByRole("button", { name: "日常购物" }).click();
+  await openMobileActions(page);
   await expect(
     page.getByRole("button", { name: "口述 / AI 添加" }),
   ).toBeVisible();
   await page.screenshot({
-    path: "docs/screenshots/shopping-mobile.png",
     fullPage: true,
   });
   expect(
@@ -93,7 +92,7 @@ test("演示账本 PC 与手机布局无横向溢出", async ({ page }) => {
   ).toBe(true);
   expect(errors).toEqual([]);
 });
-test("HTTP 权限、草稿原始时间、私有附件、公开评议与导出", async ({
+test("HTTP 权限、草稿原始时间、即时截图不留存、公开评议与导出", async ({
   request,
   browser,
   baseURL,
@@ -151,14 +150,28 @@ test("HTTP 权限、草稿原始时间、私有附件、公开评议与导出", 
       },
     },
   });
-  expect(imageCapture.ok()).toBe(true);
+  expect(imageCapture.ok(), await imageCapture.text()).toBe(true);
   state = await (await request.get("/api/state")).json();
-  const attachmentId = state.attachments[0].id;
+  expect((await imageCapture.json()).recognized).toBe(true);
+  expect(state.attachments).toHaveLength(0);
+  expect(state.drafts.some((d: any) => d.inputMethod === "image" && d.state === "ready")).toBe(true);
+  const imageDraft = state.drafts.find((d: any) => d.inputMethod === "image");
+  const confirmImage = {
+    operationId: randomUUID(), id: imageDraft.id, version: imageDraft.version,
+    selections: [{ index: 0, candidate: JSON.parse(imageDraft.result)[0] }],
+  };
+  expect((await request.post("/api/apply", { headers, data: confirmImage })).ok()).toBe(true);
+  expect((await request.post("/api/apply", { headers, data: confirmImage })).ok()).toBe(true);
+  const afterImage = await (await request.get("/api/state")).json();
+  expect(afterImage.ledger.filter((r: any) => r.sourceDraftId === imageDraft.id)).toHaveLength(1);
+  expect(afterImage.attachments).toHaveLength(0);
+  expect(JSON.stringify(afterImage)).not.toContain("data:image");
+  const attachmentId = "not-stored";
   await request.post("/api/mutate", {
     headers,
     data: { action: "settings", autoBatch: true, batchSize: 5 },
   });
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 4; i++) {
     const added = await request.post("/api/capture", {
       headers,
       multipart: {
@@ -169,13 +182,13 @@ test("HTTP 权限、草稿原始时间、私有附件、公开评议与导出", 
     });
     const ai = state.ai;
     expect((await added.json()).shouldProcess).toBe(
-      i === 2 &&
+      i === 3 &&
         ai.configured &&
         (ai.providerMode === "personal" || ai.remaining > 0),
     );
   }
   expect((await request.get(`/api/attachment/${attachmentId}`)).ok()).toBe(
-    true,
+    false,
   );
   const itemResponse = await request.post("/api/mutate", {
     headers,

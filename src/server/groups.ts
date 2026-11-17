@@ -1,4 +1,4 @@
-import { Prisma } from "@prisma/client";
+import type { Store } from "./store";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { effectiveSaving, localDate, validDate } from "@/lib/domain";
@@ -9,7 +9,7 @@ import {
   purchaseEdit,
 } from "./services";
 
-type Tx = Prisma.TransactionClient;
+type Tx = Store;
 const id = z.string().min(1).max(200);
 const money = z.number().int().min(0).max(2_000_000_000);
 const date = z.string().refine(validDate, "日期无效");
@@ -19,7 +19,9 @@ function version(record: any, expected: unknown) {
 
 export async function listGroup(tx: Tx, ownerId: string, listId: string) {
   const list = await owned(tx, "shoppingList", listId, ownerId);
-  return tx.recordGroup.upsert({
+  if (list.kind !== "shopping")
+    throw new Error("只有购物清单可以结算或查看预算");
+  return tx.recordGroup.put({
     where: { sourceListId: listId },
     create: { ownerId, name: list.name, sourceListId: listId },
     update: {},
@@ -27,15 +29,15 @@ export async function listGroup(tx: Tx, ownerId: string, listId: string) {
 }
 
 export async function invalidateList(tx: Tx, ownerId: string, listId: string) {
-  const settlement = await tx.listSettlement.findFirst({
+  const settlement = await tx.listSettlement.first({
     where: { ownerId, listId },
   });
   if (!settlement || settlement.status === "revoked") return;
-  await tx.listSettlement.update({
+  await tx.listSettlement.change({
     where: { id: settlement.id },
     data: { status: "pending", version: { increment: 1 } },
   });
-  await tx.savingEntry.updateMany({
+  await tx.savingEntry.changeAll({
     where: { ownerId, settlementId: settlement.id },
     data: { status: "pending", version: { increment: 1 } },
   });
@@ -49,11 +51,11 @@ export async function attachShoppingSource(
 ) {
   const group = await listGroup(tx, ownerId, item.listId);
   if (entryId) {
-    await tx.ledgerEntry.update({
+    await tx.ledgerEntry.change({
       where: { id: entryId },
       data: { sourceShoppingItemId: item.id, groupId: group.id },
     });
-    await tx.savingEntry.updateMany({
+    await tx.savingEntry.changeAll({
       where: { ownerId, ledgerId: entryId, source: "automatic" },
       data: {
         sourceListId: item.listId,
@@ -62,16 +64,16 @@ export async function attachShoppingSource(
       },
     });
   }
-  await tx.savingEntry.updateMany({
+  await tx.savingEntry.changeAll({
     where: { ownerId, shoppingItemId: item.id, source: "shopping" },
     data: { sourceListId: item.listId, groupId: group.id },
   });
-  const settlement = await tx.listSettlement.findFirst({
+  const settlement = await tx.listSettlement.first({
     where: { ownerId, listId: item.listId },
   });
   const list = await owned(tx, "shoppingList", item.listId, ownerId);
   if (list.savingMode === "budget" && settlement)
-    await tx.savingEntry.updateMany({
+    await tx.savingEntry.changeAll({
       where: {
         ownerId,
         sourceListId: list.id,
@@ -88,20 +90,22 @@ export async function settlementPreview(
   listId: string,
 ) {
   const list = await owned(tx, "shoppingList", listId, ownerId);
-  const items = await tx.shoppingItem.findMany({
+  if (list.kind !== "shopping")
+    throw new Error("只有购物清单可以结算或查看预算");
+  const items = await tx.shoppingItem.list({
     where: { ownerId, listId },
     orderBy: { id: "asc" },
   });
-  const entries = await tx.ledgerEntry.findMany({
+  const entries = await tx.ledgerEntry.list({
     where: { ownerId, sourceShoppingItemId: { in: items.map((i) => i.id) } },
   });
-  const refunds = await tx.ledgerEntry.findMany({
+  const refunds = await tx.ledgerEntry.list({
     where: { ownerId, refundOfId: { in: entries.map((e) => e.id) } },
   });
-  const savings = await tx.savingEntry.findMany({
+  const savings = await tx.savingEntry.list({
     where: { ownerId, sourceListId: listId },
   });
-  const settlement = await tx.listSettlement.findUnique({ where: { listId } });
+  const settlement = await tx.listSettlement.first({ where: { listId } });
   const paid = items
     .filter((i) => i.status === "purchased")
     .reduce((s, i) => s + (i.purchaseAmount ?? 0), 0);
@@ -170,6 +174,8 @@ const checkoutRow = z.object({
 export async function checkoutPreview(tx: Tx, ownerId: string, body: any) {
   const list = await owned(tx, "shoppingList", id.parse(body.id), ownerId);
   version(list, body.version);
+  if (list.kind !== "shopping")
+    throw new Error("只有购物清单可以执行购买结算");
   if (list.archived || list.closedAt) throw new Error("请先恢复或重新打开清单");
   const rows = z.array(checkoutRow).min(1).max(100).parse(body.rows);
   if (new Set(rows.map((r) => r.id)).size !== rows.length)
@@ -265,11 +271,11 @@ export async function groupAction(
 ): Promise<any> {
   if (body.action === "groupSave") {
     const name = z.string().trim().min(1).max(100).parse(body.name);
-    if (!body.id) return tx.recordGroup.create({ data: { ownerId, name } });
+    if (!body.id) return tx.recordGroup.insert({ data: { ownerId, name } });
     const group = await owned(tx, "recordGroup", id.parse(body.id), ownerId);
     version(group, body.version);
     if (group.sourceListId) throw new Error("请在来源清单修改组名");
-    return tx.recordGroup.update({
+    return tx.recordGroup.change({
       where: { id: group.id },
       data: { name, version: { increment: 1 } },
     });
@@ -293,12 +299,12 @@ export async function groupAction(
       );
       version(record, r.version);
       if (entity === "ledger")
-        await tx.ledgerEntry.update({
+        await tx.ledgerEntry.change({
           where: { id: r.id },
           data: { groupId: group?.id ?? null, version: { increment: 1 } },
         });
       else
-        await tx.savingEntry.update({
+        await tx.savingEntry.change({
           where: { id: r.id },
           data: { groupId: group?.id ?? null, version: { increment: 1 } },
         });
@@ -308,15 +314,15 @@ export async function groupAction(
   if (body.action === "groupDissolve") {
     const group = await owned(tx, "recordGroup", id.parse(body.id), ownerId);
     version(group, body.version);
-    await tx.ledgerEntry.updateMany({
+    await tx.ledgerEntry.changeAll({
       where: { ownerId, groupId: group.id },
       data: { groupId: null, version: { increment: 1 } },
     });
-    await tx.savingEntry.updateMany({
+    await tx.savingEntry.changeAll({
       where: { ownerId, groupId: group.id },
       data: { groupId: null, version: { increment: 1 } },
     });
-    await tx.recordGroup.delete({ where: { id: group.id } });
+    await tx.recordGroup.remove({ where: { id: group.id } });
     return {};
   }
   if (body.action === "listCheckout") {
@@ -333,7 +339,7 @@ export async function groupAction(
           row.existingLedgerId,
           ownerId,
         );
-        await tx.shoppingItem.update({
+        await tx.shoppingItem.change({
           where: { id: item.id },
           data: {
             status: "purchased",
@@ -351,7 +357,7 @@ export async function groupAction(
         });
         await attachShoppingSource(tx, ownerId, item, entry.id);
         if (item.ownedItemId)
-          await tx.ownedItem.updateMany({
+          await tx.ownedItem.changeAll({
             where: { ownerId, id: item.ownedItemId },
             data: {
               price: entry.amount,
@@ -361,7 +367,7 @@ export async function groupAction(
             },
           });
         else if (row.createItem) {
-          const asset = await tx.ownedItem.create({
+          const asset = await tx.ownedItem.insert({
             data: {
               ownerId,
               name: item.name,
@@ -370,7 +376,7 @@ export async function groupAction(
               ledgerId: entry.id,
             },
           });
-          await tx.shoppingItem.update({
+          await tx.shoppingItem.change({
             where: { id: item.id },
             data: { ownedItemId: asset.id },
           });
@@ -390,7 +396,7 @@ export async function groupAction(
           row.createItem &&
           !item.ownedItemId
         ) {
-          const asset = await tx.ownedItem.create({
+          const asset = await tx.ownedItem.insert({
             data: {
               ownerId,
               name: item.name,
@@ -398,7 +404,7 @@ export async function groupAction(
               purchaseDate: row.date,
             },
           });
-          await tx.shoppingItem.update({
+          await tx.shoppingItem.change({
             where: { id: item.id },
             data: { ownedItemId: asset.id },
           });
@@ -433,7 +439,7 @@ export async function groupAction(
     const list = await owned(tx, "shoppingList", id.parse(body.id), ownerId);
     version(list, body.version);
     await invalidateList(tx, ownerId, list.id);
-    return tx.shoppingList.update({
+    return tx.shoppingList.change({
       where: { id: list.id },
       data: { closedAt: null, version: { increment: 1 } },
     });
@@ -444,20 +450,20 @@ export async function groupAction(
       throw new Error("预算或关联记录已更新，请重新预览");
     if (body.action === "listSavingMode" && body.mode === "item") {
       if (p.settlement) {
-        await tx.listSettlement.update({
+        await tx.listSettlement.change({
           where: { id: p.settlement.id },
           data: { status: "revoked", version: { increment: 1 } },
         });
-        await tx.savingEntry.updateMany({
+        await tx.savingEntry.changeAll({
           where: { ownerId, settlementId: p.settlement.id },
           data: { status: "revoked", version: { increment: 1 } },
         });
-        await tx.savingEntry.updateMany({
+        await tx.savingEntry.changeAll({
           where: { ownerId, supersededBySettlementId: p.settlement.id },
           data: { supersededBySettlementId: null, version: { increment: 1 } },
         });
       }
-      return tx.shoppingList.update({
+      return tx.shoppingList.change({
         where: { id: p.list.id },
         data: { savingMode: "item", closedAt: null, version: { increment: 1 } },
       });
@@ -467,7 +473,7 @@ export async function groupAction(
         "需设置预算、完成所有购买/放弃并核对实付和手工省钱后，确认采购结束",
       );
     const group = await listGroup(tx, ownerId, p.list.id);
-    const settlement = await tx.listSettlement.upsert({
+    const settlement = await tx.listSettlement.put({
       where: { listId: p.list.id },
       create: {
         ownerId,
@@ -487,7 +493,7 @@ export async function groupAction(
         version: { increment: 1 },
       },
     });
-    await tx.savingEntry.updateMany({
+    await tx.savingEntry.changeAll({
       where: {
         ownerId,
         sourceListId: p.list.id,
@@ -509,7 +515,7 @@ export async function groupAction(
       sourceListId: p.list.id,
       status: p.surplus! > 0 ? "valid" : "revoked",
     };
-    await tx.savingEntry.upsert({
+    await tx.savingEntry.put({
       where: { settlementId: settlement.id },
       create: {
         ...values,
@@ -520,7 +526,7 @@ export async function groupAction(
       },
       update: { ...values, version: { increment: 1 } },
     });
-    await tx.shoppingList.update({
+    await tx.shoppingList.change({
       where: { id: p.list.id },
       data: {
         savingMode: "budget",

@@ -1,5 +1,9 @@
 import { test, expect } from "@playwright/test";
 import { randomUUID } from "node:crypto";
+import {
+  openDesktopNavItem,
+  openMobileActions,
+} from "./navigation-helpers";
 
 for (const mobile of [false, true]) {
   test(`${mobile ? "手机" : "桌面"}全部记账、预算去重与分组偏好`, async ({
@@ -77,6 +81,7 @@ for (const mobile of [false, true]) {
         .reduce((sum: number, s: any) => sum + s.amount, 0),
     ).toBe(20000);
     await nav.getByRole("button", { name: "账本", exact: true }).click();
+    if (mobile) await openMobileActions(page);
     await page.getByRole("button", { name: "切换为分组" }).click();
     await expect(
       page.locator(".group-heading").getByText("整单验收采购", { exact: true }),
@@ -84,6 +89,7 @@ for (const mobile of [false, true]) {
     await expect(page.getByText(/当前筛选小计/)).toBeVisible();
     await page.reload();
     await nav.getByRole("button", { name: "账本", exact: true }).click();
+    if (mobile) await openMobileActions(page);
     await expect(
       page.getByRole("button", { name: "切换为平铺" }),
     ).toBeVisible();
@@ -93,11 +99,8 @@ for (const mobile of [false, true]) {
         .locator(".mobile-more")
         .getByRole("button", { name: "省钱罐", exact: true })
         .click();
-    } else
-      await page
-        .locator(".sidebar nav")
-        .getByRole("button", { name: "省钱罐", exact: true })
-        .click();
+    } else await openDesktopNavItem(page, "省钱罐");
+    if (mobile) await openMobileActions(page);
     await expect(
       page.getByRole("button", { name: "切换为分组" }),
     ).toBeVisible();
@@ -110,7 +113,6 @@ for (const mobile of [false, true]) {
       ),
     ).toBe(true);
     await page.screenshot({
-      path: `data/p2-p3-verification/${mobile ? "mobile" : "desktop"}-savings.png`,
       fullPage: true,
     });
     expect(errors).toEqual([]);

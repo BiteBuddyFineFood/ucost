@@ -1,0 +1,47 @@
+node_modules/
+.next/
+.idea/
+.env
+.env.local
+.env.*.local
+data/
+uploads/
+*.db
+*.db-*
+*.log
+test-results/
+playwright-report/
+coverage/
+.open-next/
+.wrangler/
+.tmp/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+*.tsbuildinfo
+docs/*.html
+
+# Local agent instructions and design/planning documents
+AGENTS.md
+README.md
+docs/
+IMPLEMENTATION_PLAN.md
+
+# Local-only config files
+.gitignore
+.env.example
+
+# Database migration SQL
+*.sql
+prisma/migrations/migration_lock.toml
+!d1/migrations/*.sql
+!.gitignore
+!README.md
+!docs/
+docs/*
+!docs/PROGRESS.md
+!docs/CLOUDFLARE_MIGRATION_PLAN.md
+!docs/CLOUDFLARE_LOCAL.md
+!docs/SQLITE_LEGACY_README.md
+!wrangler.db-test.jsonc
+

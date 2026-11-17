@@ -3,7 +3,7 @@ import { db } from "./db";
 import { callAI } from "./ai";
 import { runAiTask } from "./ai-gateway";
 import { operation, owned, saveEntity } from "./services";
-import { User } from "@prisma/client";
+import type { User } from "./schema";
 
 export async function classificationPreview(user: User, body: any) {
   const entity = z.enum(["ledger", "shopping"]).parse(body.entity);
@@ -20,10 +20,10 @@ export async function classificationPreview(user: User, body: any) {
     body.operationId,
     { entity, records },
     async () => {
-      const categories = await db.category.findMany({
+      const categories = await db.category.list({
         where: { ownerId: user.id, archived: false },
       });
-      const rules = await db.categoryRule.findMany({
+      const rules = await db.categoryRule.list({
         where: { ownerId: user.id },
       });
       const input = [];
@@ -101,7 +101,7 @@ export async function classificationPreview(user: User, body: any) {
   );
 }
 export async function classificationApply(user: User, body: any) {
-  const task = await db.aiTask.findFirst({
+  const task = await db.aiTask.first({
     where: {
       ownerId: user.id,
       operationId: z.string().parse(body.taskOperationId),
@@ -135,6 +135,16 @@ export async function classificationApply(user: User, body: any) {
         );
         if (record.version !== suggestion.version)
           throw new Error("记录已更新，拒绝应用过期建议");
+        if (saved.entity === "shopping") {
+          const list = await owned(
+            tx,
+            "shoppingList",
+            record.listId,
+            user.id,
+          );
+          if (list.kind !== "shopping")
+            throw new Error("出行和普通清单条目不使用账本分类");
+        }
         if (row.categoryId) {
           const category = await owned(tx, "category", row.categoryId, user.id);
           if (category.archived || category.type !== suggestion.type)
@@ -142,15 +152,15 @@ export async function classificationApply(user: User, body: any) {
         }
         // Ledger classification changes only category; avoid resetting snapshots, money or settlement state.
         if (saved.entity === "ledger") {
-          await tx.ledgerEntry.update({
+          await tx.ledgerEntry.change({
             where: { id: record.id },
             data: { categoryId: row.categoryId, version: { increment: 1 } },
           });
-          await tx.ledgerEntry.updateMany({
+          await tx.ledgerEntry.changeAll({
             where: { ownerId: user.id, refundOfId: record.id },
             data: { categoryId: row.categoryId, version: { increment: 1 } },
           });
-          await tx.shoppingItem.updateMany({
+          await tx.shoppingItem.changeAll({
             where: { ownerId: user.id, ledgerId: record.id },
             data: { categoryId: row.categoryId, version: { increment: 1 } },
           });

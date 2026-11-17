@@ -1,5 +1,5 @@
 "use client";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AreaChart,
   Area,
@@ -19,6 +19,7 @@ import {
   ArrowUp,
   ArrowDown,
   GripVertical,
+  Bell,
 } from "lucide-react";
 import {
   defaultWidgets,
@@ -26,10 +27,28 @@ import {
   totals,
   money,
   savingTypes,
-  heldDays,
   effectiveSaving,
+  itemCostView,
+  localDate,
 } from "@/lib/domain";
-import { Modal, Empty, Jar, api, Busy } from "./ui";
+import {
+  addDays,
+  comparisonLabel,
+  comparisonRange,
+  bucketRecords,
+  daysBetween,
+  equalLengthPrevious,
+  periodLabel,
+  periodRange,
+  shiftPeriod,
+  trendBuckets,
+  trendGranularity,
+  type DateRange,
+  type NaturalPeriodMode,
+  type PeriodMode,
+} from "@/lib/period";
+import { Modal, Empty, api, Busy } from "./ui";
+import { DashboardSketch, PlayfulJar } from "./dashboard-art";
 
 export default function Dashboard({
   state,
@@ -38,42 +57,90 @@ export default function Dashboard({
   openPage,
   dates,
   setDates,
+  reminders = [],
 }: any) {
   const [customize, setCustomize] = useState(false),
     [analysis, setAnalysis] = useState<any>(null),
+    [analysisRange, setAnalysisRange] = useState<DateRange | null>(null),
     [question, setQuestion] = useState(""),
     [busy, setBusy] = useState(false),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [mode, setMode] = useState<PeriodMode>("month"),
+    [anchor, setAnchor] = useState(dates.start),
+    [today, setToday] = useState(localDate(new Date(), state.user.timezone)),
+    [costMode, setCostMode] = useState<"day" | "use">("day");
   const widgets = state.user.preferences.widgets || defaultWidgets;
   const [order, setOrder] = useState<string[]>(widgets),
     [sizes, setSizes] = useState<Record<string, string>>(
       state.user.preferences.sizes || {},
     );
   const [dragged, setDragged] = useState<string | null>(null);
+  useEffect(() => {
+    const update = () =>
+      setToday(localDate(new Date(), state.user.timezone));
+    document.addEventListener("visibilitychange", update);
+    window.addEventListener("focus", update);
+    const timer = window.setInterval(update, 60_000);
+    return () => {
+      document.removeEventListener("visibilitychange", update);
+      window.removeEventListener("focus", update);
+      window.clearInterval(timer);
+    };
+  }, [state.user.timezone]);
+  const range: DateRange = useMemo(
+    () =>
+      mode === "custom"
+        ? dates
+        : periodRange(mode as NaturalPeriodMode, anchor, today),
+    [mode, anchor, today, dates],
+  );
+  useEffect(() => {
+    if (
+      mode !== "custom" &&
+      (dates.start !== range.start || dates.end !== range.end)
+    )
+      setDates(range);
+  }, [mode, range, dates, setDates]);
   const entries = useMemo(
     () =>
       state.ledger.filter(
-        (x: any) => x.date >= dates.start && x.date <= dates.end,
+        (x: any) => x.date >= range.start && x.date <= range.end,
       ),
-    [state.ledger, dates],
+    [state.ledger, range],
   );
   const sum = totals(entries);
-  const shiftMonth = (value: string) => {
-    const [y, m, d] = value.split("-").map(Number);
-    const previous = new Date(Date.UTC(y, m - 2, 1));
-    const last = new Date(
-      Date.UTC(previous.getUTCFullYear(), previous.getUTCMonth() + 1, 0),
-    ).getUTCDate();
-    previous.setUTCDate(Math.min(d, last));
-    return previous.toISOString().slice(0, 10);
-  };
-  const previousStart = shiftMonth(dates.start),
-    previousEnd = shiftMonth(dates.end);
+  const previousRange: DateRange & { partial?: boolean } =
+    mode === "custom"
+      ? equalLengthPrevious(range)
+      : comparisonRange(mode as NaturalPeriodMode, range, today);
   const previous = totals(
     state.ledger.filter(
-      (e: any) => e.date >= previousStart && e.date <= previousEnd,
+      (e: any) =>
+        e.date >= previousRange.start && e.date <= previousRange.end,
     ),
   );
+  const difference = sum.net - previous.net;
+  const compareText =
+    previous.net === 0
+      ? sum.net === 0
+        ? "持平"
+        : `增加 ¥${money(sum.net)}（上期为 0，无可用百分比基数）`
+      : `${difference > 0 ? "增加" : difference < 0 ? "减少" : "持平"} ¥${money(
+          Math.abs(difference),
+        )}`;
+  const comparisonTruncated =
+    previousRange.partial &&
+    Date.parse(range.end) - Date.parse(range.start) !==
+      Date.parse(previousRange.end) - Date.parse(previousRange.start);
+  const nextDisabled =
+    mode === "custom"
+      ? range.end >= today ||
+        addDays(range.end, daysBetween(range.start, range.end) + 1) > today
+      : periodRange(
+          mode as NaturalPeriodMode,
+          shiftPeriod(mode as NaturalPeriodMode, anchor, 1),
+          today,
+        ).start > today;
   const categories = [...state.categories, { id: null, name: "未分类" }]
     .map((c: any) => ({
       id: c.id,
@@ -83,28 +150,24 @@ export default function Dashboard({
         .reduce((s: number, x: any) => s + x.amount, 0),
     }))
     .filter((x: any) => x.value > 0);
-  const duration = Math.min(
-    366,
-    Math.max(
-      0,
-      Math.floor((Date.parse(dates.end) - Date.parse(dates.start)) / 86400000) +
-        1,
-    ),
-  );
-  const days = Array.from({ length: duration }, (_, i) =>
-    new Date(Date.parse(dates.start) + i * 86400000).toISOString().slice(0, 10),
-  );
-  const trend = days.map((day) => {
-    const t = totals(entries.filter((e: any) => e.date === day));
+  const granularity = trendGranularity(mode, range);
+  const buckets = trendBuckets(range, granularity);
+  const groupedTrend = bucketRecords<any>(entries, buckets);
+  const trend = buckets.map((bucket) => {
+    const t = totals(groupedTrend.get(bucket.key) || []);
     return {
-      date: day.slice(5),
+      date: bucket.label,
+      full:
+        bucket.start === bucket.end
+          ? bucket.start
+          : `${bucket.start} 至 ${bucket.end}`,
       income: t.income / 100,
       expense: t.expense / 100,
     };
   });
   const savings = state.savings.filter(
     (x: any) =>
-      effectiveSaving(x) && x.date >= dates.start && x.date <= dates.end,
+      effectiveSaving(x) && x.date >= range.start && x.date <= range.end,
   );
   const colors = [
     "#356C5A",
@@ -115,6 +178,54 @@ export default function Dashboard({
     "#AAA3C2",
     "#C6D3CE",
   ];
+  function chooseMode(next: PeriodMode) {
+    setMode(next);
+    if (next === "custom") return;
+    setAnchor(today);
+    setDates(periodRange(next, today, today));
+  }
+  function movePeriod(step: number) {
+    if (mode === "custom") {
+      const length =
+        Math.round(
+          (Date.parse(range.end) - Date.parse(range.start)) / 86_400_000,
+        ) + 1;
+      const start = new Date(
+        Date.parse(range.start) + step * length * 86_400_000,
+      )
+        .toISOString()
+        .slice(0, 10);
+      const end = new Date(
+        Date.parse(range.end) + step * length * 86_400_000,
+      )
+        .toISOString()
+        .slice(0, 10);
+      if (step > 0 && (start > today || end > today)) return;
+      setDates({ start, end });
+      return;
+    }
+    const nextAnchor = shiftPeriod(
+      mode as NaturalPeriodMode,
+      anchor,
+      step,
+    );
+    const nextRange = periodRange(
+      mode as NaturalPeriodMode,
+      nextAnchor,
+      today,
+    );
+    if (step > 0 && nextRange.start > today) return;
+    setAnchor(nextAnchor);
+    setDates(nextRange);
+  }
+  function backToCurrent() {
+    if (mode === "custom") {
+      chooseMode("month");
+      return;
+    }
+    setAnchor(today);
+    setDates(periodRange(mode as NaturalPeriodMode, today, today));
+  }
   function move(key: string, step: number) {
     const next = [...order],
       i = next.indexOf(key),
@@ -132,6 +243,8 @@ export default function Dashboard({
         question,
       });
       setAnalysis(result);
+      setAnalysisRange({ start: result.filter.start, end: result.filter.end });
+      setMode("custom");
       setDates({ start: result.filter.start, end: result.filter.end });
     } catch (e) {
       setError((e as Error).message);
@@ -146,7 +259,7 @@ export default function Dashboard({
           <div className="summary-top">
             <span>这段时间，日常有数</span>
             <span className="date-caption">
-              {dates.start} 至 {dates.end}
+              {range.start} 至 {range.end}
             </span>
           </div>
           <div className="summary-values">
@@ -172,10 +285,10 @@ export default function Dashboard({
             </div>
           </div>
           <div className="comparison-note">
-            上月同期 {previousStart} 至 {previousEnd}：结余 ¥
-            {money(previous.balance)} · 净支出
-            {sum.net >= previous.net ? "增加" : "减少"} ¥
-            {money(Math.abs(sum.net - previous.net))}
+            {comparisonLabel(mode, previousRange.partial)} ·{" "}
+            {previousRange.start} 至 {previousRange.end}：净支出 {compareText}
+            {comparisonTruncated &&
+              "（上期较短，按相同已过天数截断）"}
           </div>
           <svg className="sheet-doodle" viewBox="0 0 130 45" aria-hidden="true">
             <path
@@ -218,6 +331,7 @@ export default function Dashboard({
                     dataKey="date"
                     tickLine={false}
                     axisLine={false}
+                    minTickGap={22}
                     tick={{ fill: "#71817B", fontSize: 12 }}
                   />
                   <YAxis
@@ -228,6 +342,9 @@ export default function Dashboard({
                   />
                   <Tooltip
                     formatter={(v: any) => `¥${v}`}
+                    labelFormatter={(_: any, payload: any) =>
+                      payload?.[0]?.payload?.full || ""
+                    }
                     labelStyle={{ color: "#283B38" }}
                   />
                   <Area
@@ -257,6 +374,37 @@ export default function Dashboard({
           )}
         </section>
       );
+    if (key === "reminders")
+      return (
+        <section key={key} className="panel reminder-widget">
+          <div className="panel-heading">
+            <h2>现在要处理</h2>
+            <button className="text-button" onClick={() => openPage("reminders")}>
+              提醒中心
+            </button>
+          </div>
+          {reminders.length ? (
+            reminders.slice(0, 4).map((item: any) => (
+              <button
+                className="split-row reminder-widget-row"
+                key={item.id}
+                onClick={() => openPage("reminders")}
+              >
+                <span>
+                  <Bell size={15} />
+                  {item.title}
+                </span>
+                <b>{item.targetDate || "待处理"}</b>
+              </button>
+            ))
+          ) : (
+            <Empty
+              title="眼前没有待处理提醒"
+              text="临期物品、清单准备和固定日期会出现在这里。"
+            />
+          )}
+        </section>
+      );
     if (key === "savings")
       return (
         <section key={key} className="panel saving-widget">
@@ -265,7 +413,7 @@ export default function Dashboard({
             <span className="pill">省钱罐</span>
           </div>
           <div className="jar-total">
-            <Jar />
+            <PlayfulJar />
             <div>
               <small>记录省下</small>
               <strong>
@@ -385,7 +533,10 @@ export default function Dashboard({
       return (
         <section key={key} className="panel">
           <div className="panel-heading">
-            <h2>账户余额</h2>
+            <div className="illustrated-title">
+              <DashboardSketch kind="wallet" />
+              <h2>账户余额</h2>
+            </div>
             <span className="hint">截至现在</span>
           </div>
           {state.accounts.map((a: any) => {
@@ -411,13 +562,23 @@ export default function Dashboard({
         </section>
       );
     if (key === "shopping") {
-      const list = state.shopping.filter((s: any) =>
-        ["planned", "considering"].includes(s.status),
+      const shoppingListIds = new Set(
+        state.lists
+          .filter((list: any) => (list.kind || "shopping") === "shopping")
+          .map((list: any) => list.id),
+      );
+      const list = state.shopping.filter(
+        (s: any) =>
+          shoppingListIds.has(s.listId) &&
+          ["planned", "considering"].includes(s.status),
       );
       return (
         <section key={key} className="panel">
           <div className="panel-heading">
-            <h2>还在考虑的愿望</h2>
+            <div className="illustrated-title">
+              <DashboardSketch kind="bag" />
+              <h2>还在考虑的愿望</h2>
+            </div>
             <span className="pill">{list.length} 件</span>
           </div>
           {list.length ? (
@@ -433,11 +594,20 @@ export default function Dashboard({
               text="想买的东西可以先记下来，慢慢考虑。"
             />
           )}
+          <button className="text-button sketch-link" onClick={() => openPage("shopping")}>
+            去看看愿望清单
+          </button>
         </section>
       );
     }
     if (key === "items") {
       const costs = state.items
+        .filter(
+          (item: any) =>
+            item.costEnabled !== false &&
+            item.price != null &&
+            item.purchaseDate,
+        )
         .map((item: any) => {
           const ledger = state.ledger.find((e: any) => e.id === item.ledgerId);
           const refunds = ledger
@@ -445,22 +615,42 @@ export default function Dashboard({
                 .filter((e: any) => e.refundOfId === ledger.id)
                 .reduce((a: number, e: any) => a + e.amount, 0)
             : 0;
+          const usageCount = state.usage
+            .filter((u: any) => u.itemId === item.id)
+            .reduce((a: number, u: any) => a + u.count, 0);
+          const view = itemCostView(
+            { ...item, mode: costMode },
+            { ledger, refunds, usageCount, today },
+          );
           return {
             ...item,
-            cost:
-              ((ledger?.amount ?? item.price) - refunds - item.recovery) /
-              heldDays(item.purchaseDate, item.retiredDate),
+            view,
           };
         })
-        .sort((a: any, b: any) => b.cost - a.cost)
+        .filter((item: any) => item.view.value != null)
+        .sort((a: any, b: any) => b.view.value - a.view.value)
         .slice(0, 5);
       return (
         <section key={key} className="panel">
           <div className="panel-heading">
-            <h2>物品成本排行</h2>
-            <button className="text-button" onClick={() => openPage("items")}>
-              截至现在
-            </button>
+            <div className="illustrated-title">
+              <DashboardSketch kind="hourglass" />
+              <h2>物品成本排行</h2>
+            </div>
+            <div className="cost-mode-toggle">
+              <button
+                className={costMode === "day" ? "selected" : ""}
+                onClick={() => setCostMode("day")}
+              >
+                按天
+              </button>
+              <button
+                className={costMode === "use" ? "selected" : ""}
+                onClick={() => setCostMode("use")}
+              >
+                按次
+              </button>
+            </div>
           </div>
           {costs.length ? (
             costs.map((item: any) => (
@@ -470,12 +660,22 @@ export default function Dashboard({
                 onClick={() => openPage("items")}
               >
                 <span>{item.name}</span>
-                <b>¥{money(item.cost)} / 天</b>
+                <b>
+                  ¥{money(item.view.value)} {item.view.unit}
+                </b>
               </button>
             ))
           ) : (
-            <Empty title="记录一件常用物品" text="让每一次使用，都有迹可循。" />
+            <Empty
+              title={
+                costMode === "use" ? "还没有可排名的使用记录" : "记录一件常用物品"
+              }
+              text="让每一次使用，都有迹可循。"
+            />
           )}
+          <button className="text-button" onClick={() => openPage("items")}>
+            查看截至今天的全部成本
+          </button>
         </section>
       );
     }
@@ -484,23 +684,86 @@ export default function Dashboard({
   return (
     <>
       <div className="dashboard-toolbar">
-        <div className="date-range">
-          <label>
-            从
+        <div className="period-toolbar">
+          <div className="period-tabs" aria-label="统计周期">
+            {(
+              [
+                ["day", "日"],
+                ["week", "周"],
+                ["month", "月"],
+                ["half", "半年"],
+                ["year", "年"],
+                ["custom", "自定义"],
+              ] as [PeriodMode, string][]
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                className={mode === key ? "selected" : ""}
+                onClick={() => chooseMode(key)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="period-nav">
+            <button
+              className="button secondary compact"
+              onClick={() => movePeriod(-1)}
+            >
+              上一{{
+                day: "天",
+                week: "周",
+                month: "月",
+                half: "半年度",
+                year: "年",
+                custom: "段",
+              }[mode]}
+            </button>
+            <button className="period-current" onClick={backToCurrent}>
+              {periodLabel(mode, range, today)}
+              <small>
+                {range.start} 至 {range.end}
+              </small>
+            </button>
+            <button
+              className="button secondary compact"
+              disabled={nextDisabled}
+              onClick={() => movePeriod(1)}
+            >
+              下一{{
+                day: "天",
+                week: "周",
+                month: "月",
+                half: "半年度",
+                year: "年",
+                custom: "段",
+              }[mode]}
+            </button>
+          </div>
+          <div className="date-range">
+            <label>
+              从
+              <input
+                aria-label="统计开始日期"
+                type="date"
+                value={range.start}
+                onChange={(e) => {
+                  setMode("custom");
+                  setDates({ start: e.target.value, end: range.end });
+                }}
+              />
+            </label>
+            <span>至</span>
             <input
-              aria-label="统计开始日期"
+              aria-label="统计结束日期"
               type="date"
-              value={dates.start}
-              onChange={(e) => setDates({ ...dates, start: e.target.value })}
+              value={range.end}
+              onChange={(e) => {
+                setMode("custom");
+                setDates({ start: range.start, end: e.target.value });
+              }}
             />
-          </label>
-          <span>至</span>
-          <input
-            aria-label="统计结束日期"
-            type="date"
-            value={dates.end}
-            onChange={(e) => setDates({ ...dates, end: e.target.value })}
-          />
+          </div>
         </div>
         <button
           className="button secondary"
@@ -517,6 +780,7 @@ export default function Dashboard({
         {widgets.map((key: string) => (
           <div
             className={`widget-wrap ${key === "summary" ? "full" : sizes[key] === "wide" ? "chosen-wide" : key === "trend" ? "span-wide" : ""}`}
+            data-widget={key}
             key={key}
           >
             {render(key)}
@@ -534,7 +798,11 @@ export default function Dashboard({
             onChange={(e) => setQuestion(e.target.value)}
             placeholder="例如：看看这个月吃饭花了多少，和上个月比比"
           />
-          <button className="button" disabled={busy} onClick={runAnalysis}>
+          <button
+            className="button"
+            disabled={busy || !state.ai?.allowed}
+            onClick={runAnalysis}
+          >
             {busy ? <Busy /> : "分析账目"}
           </button>
         </div>
@@ -542,10 +810,17 @@ export default function Dashboard({
         {analysis && (
           <div className="analysis-result">
             <small>
-              {analysis.filter.start} 至 {analysis.filter.end} ·{" "}
+              {analysisRange?.start} 至 {analysisRange?.end} ·{" "}
               {new Date(analysis.createdAt).toLocaleString("zh-CN")}
               {analysis.cached && " · 已缓存"}
             </small>
+            {analysisRange &&
+              (analysisRange.start !== range.start ||
+                analysisRange.end !== range.end) && (
+                <p className="warning">
+                  当前统计范围已改变，这份分析对应的是上方旧区间。
+                </p>
+              )}
             <p>{analysis.content}</p>
           </div>
         )}

@@ -1,23 +1,25 @@
-import { Prisma, PrismaClient } from "@prisma/client";
-import { setTimeout as delay } from "node:timers/promises";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+import type { D1Database } from "@cloudflare/workers-types";
+import { connectStore, planBatch, StoreConflict, type Store } from "./store";
 
-const globalDb = globalThis as unknown as { prisma?: PrismaClient };
-export const db = globalDb.prisma ?? new PrismaClient();
-if (process.env.NODE_ENV !== "production") globalDb.prisma = db;
-
-// Only short rolled-back writes are retried. External calls remain outside transactions.
-export async function writeTransaction<T>(
-  action: (tx: Prisma.TransactionClient) => Promise<T>,
-  options = { maxWait: 10000, timeout: 15000 },
-): Promise<T> {
+let testBinding: D1Database | undefined;
+export function installLocalDatabase(binding: D1Database) {
+  if (process.env.NODE_ENV !== "test" && process.env.UCOST_LOCAL_TOOL !== "true")
+    throw new Error("Explicit local binding is only available in tests/local tools");
+  testBinding = binding;
+}
+export async function database(): Promise<D1Database> {
+  if (testBinding) return testBinding;
+  return (await getCloudflareContext({ async: true })).env.DB;
+}
+export const db = connectStore(database);
+export async function writeBatch<T>(action: (tx: Store) => Promise<T>, _options?: unknown): Promise<T> {
+  void _options; // Legacy timeout options do not change Workers/D1 limits.
   for (let attempt = 0; ; attempt++) {
     try {
-      return await db.$transaction(action, options);
+      return await planBatch(await database(), action);
     } catch (error) {
-      const code = (error as any)?.code;
-      if (attempt >= 2 || !["P2034", "P1008", "P2028"].includes(code))
-        throw error;
-      await delay(25 * (attempt + 1));
+      if (!(error instanceof StoreConflict) || attempt >= 4) throw error;
     }
   }
 }

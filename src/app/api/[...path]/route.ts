@@ -1,8 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { randomUUID, createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
 import {
   currentUser,
   requireUser,
@@ -12,14 +10,17 @@ import {
   logout,
   limitLogin,
 } from "@/server/auth";
-import { db } from "@/server/db";
+import { db, writeBatch } from "@/server/db";
 import { mutate, owned, snapshot, vote } from "@/server/services";
 import {
   analyze,
   applyDraft,
+  chat,
   processDrafts,
   polish,
   suggest,
+  processImageCapture,
+  assertTextOnly,
 } from "@/server/ai";
 import {
   aiConfig,
@@ -37,7 +38,6 @@ import { exportData, previewImport, commitImport } from "@/server/exchange";
 import { exportCsv } from "@/server/exchange-codec";
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
 const json = (data: unknown, status = 200) =>
   NextResponse.json(data, { status, headers: { "Cache-Control": "no-store" } });
 function checkOrigin(req: NextRequest) {
@@ -89,7 +89,7 @@ export async function GET(
   try {
     const segments = (await ctx.params).path;
     if (segments[0] === "review" && segments[1]) {
-      const review = await db.reviewRequest.findUnique({
+      const review = await db.reviewRequest.first({
         where: { token: segments[1] },
       });
       const user = await currentUser();
@@ -99,7 +99,7 @@ export async function GET(
         (review.visibility === "private" && review.ownerId !== user?.id)
       )
         return json({ error: "分享链接已失效或无权访问" }, 404);
-      const votes = await db.reviewVote.findMany({
+      const votes = await db.reviewVote.list({
         where: { reviewId: review.id },
         select: {
           id: true,
@@ -126,7 +126,9 @@ export async function GET(
           userId: undefined,
           isMine: v.userId === user?.id,
         })),
-        user: user ? { username: user.username } : null,
+        user: user
+          ? { username: user.username, aiAllowed: !!(await aiUsage(user.id)).allowed }
+          : null,
       });
     }
     const user = await requireUser();
@@ -138,20 +140,8 @@ export async function GET(
       return json(await aiTaskStatus(user.id, segments[2]));
     if (segments[0] === "state") return json(await snapshot(user));
     if (segments[0] === "attachment" && segments[1]) {
-      const attachment = await owned(db, "attachment", segments[1], user.id);
-      if (attachment.missing)
-        throw new Error("附件未迁移，请通过完整文件备份恢复");
-      const file = await readFile(
-        path.join(process.cwd(), "uploads", attachment.storageKey),
-      );
-      return new NextResponse(file, {
-        headers: {
-          "Content-Type": attachment.mime,
-          "Content-Disposition": "inline",
-          "Cache-Control": "private, no-store",
-          "X-Content-Type-Options": "nosniff",
-        },
-      });
+      await owned(db, "attachment", segments[1], user.id);
+      return json({ error: "截图不在此版本存储；旧文件仍保留在原本地位置" }, 410);
     }
     if (segments[0] === "export") {
       const data = await exportData(user);
@@ -203,14 +193,22 @@ export async function POST(
         return json({ ok: true });
       }
       const body = z
-        .object({ username: z.string().max(40), password: z.string().max(100) })
+        .object({
+          username: z.string().max(40),
+          password: z.string().max(100),
+          inviteCode: z.string().max(40).optional(),
+        })
         .parse(await req.json());
-      limitLogin(
-        `${req.headers.get("x-forwarded-for") || "local"}:${body.username}`,
+      await limitLogin(
+        `${req.headers.get("cf-connecting-ip") || "local"}:${body.username}`,
       );
       const user =
         segments[1] === "register"
-          ? await register(body.username.trim(), body.password)
+          ? await register(
+              body.username.trim(),
+              body.password,
+              body.inviteCode || "",
+            )
           : await login(body.username.trim(), body.password);
       await createSession(user.id);
       return json({ ok: true });
@@ -221,20 +219,33 @@ export async function POST(
       const captureId = form.get("captureId")
         ? z.string().uuid().parse(form.get("captureId"))
         : randomUUID();
-      const previousCapture = await db.captureDraft.findUnique({
+      const previousCapture = await db.captureDraft.first({
         where: { id: captureId },
       });
       if (previousCapture) {
         if (previousCapture.ownerId !== user.id)
           throw new Error("采集标识不可用");
-        return json({ draft: previousCapture, shouldProcess: false });
+        if (previousCapture.state !== "failed" && previousCapture.inputMethod !== "image")
+          return json({ draft: previousCapture, shouldProcess: false });
+        if (["ready", "applied"].includes(previousCapture.state))
+          return json({ draft: previousCapture, shouldProcess: false, recognized: true });
       }
       const input = z
         .string()
         .max(20000)
         .parse(form.get("text") || "");
+      assertTextOnly(input);
       const target = z
-        .enum(["auto", "ledger", "shopping", "items", "savings", "text"])
+        .enum([
+          "auto",
+          "ledger",
+          "shopping",
+          "items",
+          "itemUpdate",
+          "reminder",
+          "savings",
+          "text",
+        ])
         .parse(form.get("target") || "ledger");
       const targetListId = String(form.get("targetListId") || "") || null;
       if (targetListId) {
@@ -267,7 +278,6 @@ export async function POST(
         file: File;
         buffer: Buffer;
         hash: string;
-        storageKey: string;
       }[] = [];
       for (const file of files) {
         if (
@@ -290,18 +300,10 @@ export async function POST(
         )
           throw new Error("图片内容与文件类型不一致");
         const hash = createHash("sha256").update(buffer).digest("hex");
-        if (await db.attachment.count({ where: { ownerId: user.id, hash } }))
-          warnings.push("这张图片曾上传过，请留意重复入账");
-        prepared.push({ file, buffer, hash, storageKey: randomUUID() });
+        prepared.push({ file, buffer, hash });
       }
-      await mkdir(path.join(process.cwd(), "uploads"), { recursive: true });
-      for (const p of prepared)
-        await writeFile(
-          path.join(process.cwd(), "uploads", p.storageKey),
-          p.buffer,
-        );
-      const draft = await db.$transaction(async (tx) => {
-        const draft = await tx.captureDraft.create({
+      const draft = previousCapture || await writeBatch(async (tx) => {
+        return tx.captureDraft.insert({
           data: {
             id: captureId,
             ownerId: user.id,
@@ -310,24 +312,25 @@ export async function POST(
             targetListId,
             capturedAt,
             captureTimezone: timezone,
-            inputMethod: String(form.get("inputMethod") || "text"),
+            inputMethod: files.length ? "image" : String(form.get("inputMethod") || "text"),
             warnings: JSON.stringify(warnings),
           },
         });
-        for (const p of prepared)
-          await tx.attachment.create({
-            data: {
-              ownerId: user.id,
-              draftId: draft.id,
-              storageKey: p.storageKey,
-              name: p.file.name.slice(0, 200),
-              mime: p.file.type,
-              size: p.file.size,
-              hash: p.hash,
-            },
-          });
-        return draft;
       });
+      if (prepared.length) {
+        let result;
+        try { result = await processImageCapture(user, draft.id,
+          prepared.map(p => `data:${p.file.type};base64,${p.buffer.toString("base64")}`),
+          prepared.map(p => p.hash)); }
+        catch (error) {
+          await db.captureDraft.change({ where: { id: draft.id }, data: {
+            state: "failed", error: "识别未完成，截图未保存；请在本页重试，刷新后需重新选择截图",
+          } });
+          throw error;
+        }
+        if (result.error) throw new Error(result.error);
+        return json({ draft: await db.captureDraft.require({ where: { id: draft.id } }), recognized: true, shouldProcess: false });
+      }
       const pending = await db.captureDraft.count({
         where: { ownerId: user.id, state: "pending" },
       });
@@ -338,7 +341,7 @@ export async function POST(
           user.autoBatch &&
           pending >= user.batchSize &&
           ai.configured &&
-          (ai.providerMode === "personal" || ai.remaining > 0),
+          (ai.providerMode === "personal" || ai.unlimited || (ai.remaining ?? 0) > 0),
       });
     }
     if (segments[0] === "import") {
@@ -365,6 +368,7 @@ export async function POST(
     if (segments[0] === "apply") return json(await applyDraft(user, body));
     if (segments[0] === "process") return json(await processDrafts(user, body));
     if (segments[0] === "analysis") return json(await analyze(user, body));
+    if (segments[0] === "chat") return json(await chat(user, body));
     if (segments[0] === "suggest") return json(await suggest(user, body));
     if (segments[0] === "ai-test") {
       return json(await testPersonalConfig(user.id));

@@ -109,11 +109,15 @@ export function Modal({
   children,
   close,
   wide = false,
+  sheet = false,
+  className = "",
 }: {
   title: string;
   children: React.ReactNode;
   close: () => void;
   wide?: boolean;
+  sheet?: boolean;
+  className?: string;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
@@ -123,8 +127,9 @@ export function Modal({
   }, []);
   return (
     <dialog
-      className={`modal ${wide ? "wide" : ""}`}
+      className={`modal ${wide ? "wide" : ""} ${sheet ? "sheet" : ""} ${className}`}
       ref={ref}
+      aria-label={title}
       onCancel={(e) => {
         e.preventDefault();
         close();
@@ -387,6 +392,24 @@ export function fieldsFor(entity: string, data: any, state: any): Field[] {
             },
           ]
         : []),
+      {
+        key: "groupId",
+        label: "记录分组",
+        type: "select",
+        options: [
+          { value: "", label: "未分组" },
+          ...(state.groups || []).map((g: any) => ({
+            value: g.id,
+            label: `${g.name}${
+              g.sourceDeleted
+                ? " · 来源清单已删除"
+                : g.sourceListId
+                  ? " · 清单来源"
+                  : ""
+            }`,
+          })),
+        ],
+      },
       ...(data.type === "expense"
         ? [
             { key: "discount", label: "真实优惠（元）", type: "money" },
@@ -409,11 +432,56 @@ export function fieldsFor(entity: string, data: any, state: any): Field[] {
   if (entity === "lists")
     return [
       { key: "name", label: "清单名称", required: true },
-      { key: "budget", label: "清单总预算（元，可不设置）", type: "money" },
+      {
+        key: "kind",
+        label: "用途",
+        type: "select",
+        options: [
+          { value: "shopping", label: "购物清单" },
+          { value: "travel", label: "出行清单" },
+          { value: "normal", label: "普通清单" },
+        ],
+        hint: data.id
+          ? "有内容的清单不能直接更改用途；空清单可直接调整。"
+          : "购物保留预算和记账；出行与普通清单不产生财务记录。",
+      },
+      ...(data.kind === "travel"
+        ? [{ key: "departureDate", label: "出发日期", type: "date" }]
+        : []),
+      ...(data.kind === "shopping"
+        ? [
+            {
+              key: "budget",
+              label: "清单总预算（元，可不设置）",
+              type: "money",
+            },
+          ]
+        : []),
       { key: "description", label: "说明", type: "textarea" },
       { key: "archived", label: "归档清单", type: "checkbox" },
     ];
-  if (entity === "shopping")
+  if (entity === "shopping") {
+    const list = state.lists.find((row: any) => row.id === data.listId);
+    if (list && list.kind !== "shopping")
+      return [
+        {
+          key: "listId",
+          label: "放进哪个清单",
+          type: "select",
+          options: state.lists
+            .filter((x: any) => !x.archived)
+            .map((x: any) => ({ value: x.id, label: x.name })),
+        },
+        { key: "name", label: "条目名称", required: true },
+        { key: "quantity", label: "数量 / 单位（可选）" },
+        {
+          key: "groupName",
+          label: "分组",
+          hint: "例如：证件、衣物、洗漱；不占用账本分类。",
+        },
+        { key: "note", label: "备注", type: "textarea" },
+        { key: "done", label: "已准备完成", type: "checkbox" },
+      ];
     return [
       {
         key: "listId",
@@ -467,15 +535,101 @@ export function fieldsFor(entity: string, data: any, state: any): Field[] {
         ["note", "自己的备注"],
       ].map(([key, label]) => ({ key, label, type: "textarea" })),
     ];
+  }
+  if (entity === "itemUpdate")
+    return [
+      {
+        key: "itemId",
+        label: "要修改哪件物品",
+        type: "select",
+        options: [
+          { value: "", label: "请选择" },
+          ...(state.items || [])
+            .filter((item: any) => item.status === "active")
+            .map((item: any) => ({
+              value: item.id,
+              label: `${item.name} · 现有 ${item.quantity || 0}${item.unit || ""}${
+                item.location ? ` · ${item.location}` : ""
+              }${item.expiresOn ? ` · 到期 ${item.expiresOn}` : ""}`,
+            })),
+        ],
+      },
+      { key: "quantity", label: "修改后的数量", type: "number" },
+      { key: "unit", label: "单位" },
+      { key: "location", label: "修改后的位置" },
+      {
+        key: "boxId",
+        label: "收纳箱",
+        type: "select",
+        options: [
+          { value: "", label: "不放进箱子" },
+          ...(state.boxes || []).map((box: any) => ({
+            value: box.id,
+            label: `${box.name}${box.location ? ` · ${box.location}` : ""}`,
+          })),
+        ],
+      },
+      { key: "expiresOn", label: "修改后的到期日", type: "date" },
+      {
+        key: "status",
+        label: "状态",
+        type: "select",
+        options: [
+          { value: "", label: "保持原状态" },
+          { value: "active", label: "在用" },
+          { value: "used", label: "已用完" },
+          { value: "discarded", label: "已丢弃" },
+          { value: "archived", label: "已归档" },
+        ],
+      },
+      { key: "note", label: "备注", type: "textarea" },
+    ];
+  if (entity === "reminder")
+    return [
+      {
+        key: "targetId",
+        label: "提醒哪件物品",
+        type: "select",
+        options: [
+          { value: "", label: "跟随同批新物品 / 请选择" },
+          ...(state.items || [])
+            .filter((item: any) => item.status === "active")
+            .map((item: any) => ({
+              value: item.id,
+              label: `${item.name}${item.expiresOn ? ` · 到期 ${item.expiresOn}` : ""}`,
+            })),
+        ],
+      },
+      {
+        key: "triggerType",
+        label: "提醒方式",
+        type: "select",
+        options: [
+          { value: "relative", label: "按到期日提前" },
+          { value: "fixed", label: "固定时间" },
+        ],
+      },
+      {
+        key: "offsetDays",
+        label: "提前天数",
+        type: "number",
+        hint: "0 表示到期当天。",
+      },
+      { key: "fixedAt", label: "固定提醒时间", type: "datetime-local" },
+      { key: "localTime", label: "每天提醒时间", hint: "例如 09:00" },
+      { key: "timezone", label: "时区", hint: "默认跟随账户时区。" },
+      { key: "enabled", label: "启用提醒", type: "checkbox" },
+    ];
   if (entity === "items")
     return [
       { key: "name", label: "物品名称", required: true },
-      { key: "purchaseDate", label: "购入日期", type: "date", required: true },
+      { key: "quantity", label: "数量", type: "number" },
+      { key: "unit", label: "单位", hint: "例如件、盒、瓶。" },
+      { key: "purchaseDate", label: "购入日期（算成本时填写）", type: "date" },
       {
         key: "price",
         label: "购入金额（元）",
         type: "money",
-        required: true,
         disabled: !!data.ledgerId,
         hint: data.ledgerId
           ? "跟随关联购入账单，修改价格请去账本。"
@@ -497,6 +651,7 @@ export function fieldsFor(entity: string, data: any, state: any): Field[] {
         hint: "仅影响成本，实际收到的钱请另记收入。",
       },
       { key: "retiredDate", label: "退役日期（仍在用可留空）", type: "date" },
+      { key: "costEnabled", label: "计算物品成本", type: "checkbox" },
       {
         key: "mode",
         label: "默认成本口径",
@@ -506,6 +661,30 @@ export function fieldsFor(entity: string, data: any, state: any): Field[] {
           { value: "use", label: "按次数" },
         ],
       },
+      {
+        key: "storageEnabled",
+        label: "登记收纳位置",
+        type: "checkbox",
+      },
+      { key: "location", label: "收纳位置" },
+      {
+        key: "boxId",
+        label: "收纳箱",
+        type: "select",
+        options: [
+          { value: "", label: "不放进箱子" },
+          ...(state.boxes || []).map((box: any) => ({
+            value: box.id,
+            label: `${box.name}${box.location ? ` · ${box.location}` : ""}`,
+          })),
+        ],
+      },
+      {
+        key: "expiryEnabled",
+        label: "登记保质期",
+        type: "checkbox",
+      },
+      { key: "expiresOn", label: "到期日", type: "date" },
       { key: "note", label: "备注", type: "textarea" },
     ];
   if (entity === "savings")
@@ -628,13 +807,37 @@ export function initialData(entity: string, state: any, extra: any = {}) {
       status: "considering",
       categoryId: null,
     },
-    lists: { name: "", archived: false },
+    lists: { name: "", kind: "shopping", archived: false },
     items: {
       name: "",
+      quantity: 1,
+      unit: "件",
       purchaseDate: localDate(),
       price: null,
       recovery: 0,
       mode: "day",
+      costEnabled: false,
+      storageEnabled: false,
+      expiryEnabled: false,
+    },
+    itemUpdate: {
+      itemId: null,
+      itemVersion: null,
+      quantity: null,
+      unit: "",
+      location: "",
+      boxId: null,
+      expiresOn: null,
+      status: "",
+      note: "",
+    },
+    reminder: {
+      targetId: null,
+      triggerType: "relative",
+      offsetDays: 0,
+      localTime: "09:00",
+      timezone: state.user?.timezone || "Asia/Shanghai",
+      enabled: true,
     },
     savings: { title: "", type: "skipped", date: localDate(), amount: null },
     accounts: { name: "", opening: 0 },
@@ -756,12 +959,13 @@ export function Editor({
   close: () => void;
 }) {
   const [data, setData] = useState(initialData(entity, state, record));
+  const [extraItems, setExtraItems] = useState<any[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const titles: Record<string, string> = {
     ledger: "账单",
-    shopping: "购物物品",
-    lists: "购物清单",
+    shopping: "清单条目",
+    lists: "清单",
     items: "物品档案",
     savings: "省钱记录",
     accounts: "账户",
@@ -796,7 +1000,16 @@ export function Editor({
           setBusy(true);
           setError("");
           try {
-            await save(data);
+            await save({
+              ...data,
+              ...(extraItems.some((item) => String(item.name || "").trim())
+                ? {
+                    items: extraItems.filter((item) =>
+                      String(item.name || "").trim(),
+                    ),
+                  }
+                : {}),
+            });
             close();
           } catch (err) {
             setError((err as Error).message);
@@ -839,6 +1052,154 @@ export function Editor({
             />
           ))}
         </div>
+        {entity === "ledger" && data.type === "expense" && (
+          <section className="registration-box ledger-registration">
+            <div className="ledger-registration-head">
+              <div>
+                <b>顺手登记物品（可选）</b>
+                <p className="hint">
+                  只保存来源说明快照，不继承本笔账单金额，也不会自动建立成本关联。
+                </p>
+              </div>
+              <button
+                type="button"
+                className="button secondary compact"
+                onClick={() =>
+                  setExtraItems([
+                    ...extraItems,
+                    {
+                      name: data.title || "",
+                      quantity: 1,
+                      unit: "件",
+                      storageEnabled: false,
+                      expiryEnabled: false,
+                      expiresOn: "",
+                      location: "",
+                      costEnabled: false,
+                      price: null,
+                      purchaseDate: data.date || localDate(),
+                    },
+                  ])
+                }
+              >
+                添加一行
+              </button>
+            </div>
+            {extraItems.map((row, index) => {
+              const patch = (values: any) =>
+                setExtraItems(
+                  extraItems.map((item, itemIndex) =>
+                    itemIndex === index ? { ...item, ...values } : item,
+                  ),
+                );
+              return (
+                <div className="ledger-item-row" key={index}>
+                  <FieldInput
+                    field={{ key: "name", label: "物品名称", required: true }}
+                    value={row.name}
+                    set={(value) => patch({ name: value })}
+                  />
+                  <div className="quantity-field">
+                    <FieldInput
+                      field={{ key: "quantity", label: "数量", type: "number" }}
+                      value={row.quantity}
+                      set={(value) => patch({ quantity: value ?? 0 })}
+                    />
+                    <FieldInput
+                      field={{ key: "unit", label: "单位" }}
+                      value={row.unit}
+                      set={(value) => patch({ unit: value })}
+                    />
+                  </div>
+                  <div className="ledger-item-toggles">
+                    <label className="check-field">
+                      <input
+                        type="checkbox"
+                        checked={row.storageEnabled}
+                        onChange={(e) =>
+                          patch({ storageEnabled: e.target.checked })
+                        }
+                      />
+                      收纳
+                    </label>
+                    <label className="check-field">
+                      <input
+                        type="checkbox"
+                        checked={row.expiryEnabled}
+                        onChange={(e) =>
+                          patch({ expiryEnabled: e.target.checked })
+                        }
+                      />
+                      保质期
+                    </label>
+                    <label className="check-field">
+                      <input
+                        type="checkbox"
+                        checked={row.costEnabled}
+                        onChange={(e) =>
+                          patch({ costEnabled: e.target.checked })
+                        }
+                      />
+                      独立成本
+                    </label>
+                  </div>
+                  {row.storageEnabled && (
+                    <FieldInput
+                      field={{
+                        key: "location",
+                        label: "收纳位置",
+                        hint: "例如：厨房 / 上层柜",
+                      }}
+                      value={row.location}
+                      set={(value) => patch({ location: value })}
+                    />
+                  )}
+                  {row.expiryEnabled && (
+                    <FieldInput
+                      field={{ key: "expiresOn", label: "到期日", type: "date" }}
+                      value={row.expiresOn}
+                      set={(value) => patch({ expiresOn: value })}
+                    />
+                  )}
+                  {row.costEnabled && (
+                    <>
+                      <FieldInput
+                        field={{
+                          key: "price",
+                          label: "这件物品的购入总价（元）",
+                          type: "money",
+                          hint: "独立确认，不按账单金额分摊。",
+                        }}
+                        value={row.price}
+                        set={(value) => patch({ price: value })}
+                      />
+                      <FieldInput
+                        field={{
+                          key: "purchaseDate",
+                          label: "购入日期",
+                          type: "date",
+                        }}
+                        value={row.purchaseDate}
+                        set={(value) => patch({ purchaseDate: value })}
+                      />
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    className="text-button danger-text"
+                    onClick={() =>
+                      setExtraItems(
+                        extraItems.filter((_, itemIndex) => itemIndex !== index),
+                      )
+                    }
+                  >
+                    移除这一行
+                  </button>
+                </div>
+              );
+            })}
+          </section>
+        )}
         {data.source === "automatic" && (
           <p className="hint">
             自动优惠的金额与日期跟随原账单，请到关联账单修改。
@@ -863,6 +1224,7 @@ export function Editor({
 }
 
 function InlineAI({ entity, data, state, adopt, report }: any) {
+  const allowed = !!state.ai?.allowed;
   const [description, setDescription] = useState(""),
     [suggestion, setSuggestion] = useState<any>(null),
     [busy, setBusy] = useState(false);
@@ -883,7 +1245,7 @@ function InlineAI({ entity, data, state, adopt, report }: any) {
       />
       <button
         className="button secondary"
-        disabled={busy || !description.trim()}
+        disabled={busy || !description.trim() || !allowed}
         onClick={async () => {
           setBusy(true);
           report("");

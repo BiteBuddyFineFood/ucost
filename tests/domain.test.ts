@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   cents,
   heldDays,
+  itemCostView,
   localDate,
   reviewResult,
   savingSplit,
@@ -44,6 +45,47 @@ describe("日期和物品成本", () => {
   it("购入当天为一天，退役后截止日固定", () => {
     expect(heldDays("2026-11-11", null, "2026-11-11")).toBe(1);
     expect(heldDays("2026-11-01", "2026-11-10", "2026-12-01")).toBe(10);
+  });
+  it("按天和按次使用同一净成本口径，零次不冒充按天结果", () => {
+    const item = {
+      price: 30000,
+      purchaseDate: "2026-08-06",
+      mode: "day",
+    };
+    expect(
+      itemCostView(item, {
+        usageCount: 10,
+        today: "2026-11-13",
+      }),
+    ).toMatchObject({
+      value: 300,
+      unit: "/天",
+      secondary: { value: 3000, unit: "/次" },
+    });
+    expect(
+      itemCostView({ ...item, mode: "use" }, {
+        usageCount: 10,
+        today: "2026-11-13",
+      }),
+    ).toMatchObject({
+      value: 3000,
+      unit: "/次",
+      secondary: { value: 300, unit: "/天" },
+    });
+    expect(
+      itemCostView({ ...item, mode: "use" }, {
+        usageCount: 0,
+        today: "2026-11-13",
+      }),
+    ).toMatchObject({
+      value: null,
+      unit: "/次",
+      label: "暂无使用记录",
+    });
+    expect(itemCostView({ ...item, costEnabled: false })).toMatchObject({
+      value: null,
+      label: "未计算成本",
+    });
   });
   it("采集时间按采集时区得到日期", () => {
     expect(localDate("2026-11-10T18:35:00Z", "Asia/Shanghai")).toBe(

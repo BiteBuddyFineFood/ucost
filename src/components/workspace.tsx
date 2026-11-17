@@ -33,6 +33,7 @@ import {
   SlidersHorizontal,
   Search,
   Ellipsis,
+  Download,
 } from "lucide-react";
 import {
   api,
@@ -63,7 +64,7 @@ import {
   Classification,
   AiStatus,
 } from "./enhancements";
-import { Capture, DraftInbox, DraftSection } from "./capture";
+import { Capture, DraftInbox, DraftSection, FilterMenu } from "./capture";
 import Assistant from "./assistant";
 import { answerAssistant } from "@/lib/assistant";
 import {
@@ -139,6 +140,7 @@ export default function Workspace() {
     [type, setType] = useState("all"),
     [category, setCategory] = useState("all"),
     [account, setAccount] = useState("all"),
+    [openMenu, setOpenMenu] = useState<string | null>(null),
     [listId, setListId] = useState<string | null>(null),
     [listKind, setListKind] = useState("all"),
     [showArchived, setShowArchived] = useState(false),
@@ -1013,71 +1015,77 @@ export default function Workspace() {
                       setPageIndex(0);
                     }}
                   />
-                  <select
-                    aria-label="类型筛选"
+                  <FilterMenu
+                    open={openMenu === "type"}
+                    onToggle={() =>
+                      setOpenMenu(openMenu === "type" ? null : "type")
+                    }
+                    label="类型"
                     value={type}
-                    onChange={(e) => {
-                      setType(e.target.value);
+                    options={[
+                      ["all", "全部类型"],
+                      ...Object.entries(
+                        page === "ledger" ? entryTypes : savingTypes,
+                      ),
+                    ]}
+                    onChange={(v) => {
+                      setType(v);
                       setSelection([]);
                       setPageIndex(0);
                     }}
-                  >
-                    <option value="all">全部类型</option>
-                    {Object.entries(
-                      page === "ledger" ? entryTypes : savingTypes,
-                    ).map(([key, label]) => (
-                      <option key={key} value={key}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    aria-label="分类或来源筛选"
+                    ariaLabel="类型筛选"
+                  />
+                  <FilterMenu
+                    open={openMenu === "category"}
+                    onToggle={() =>
+                      setOpenMenu(openMenu === "category" ? null : "category")
+                    }
+                    label="分类"
                     value={category}
-                    onChange={(e) => {
-                      setCategory(e.target.value);
+                    options={
+                      page === "ledger"
+                        ? [
+                            ["all", "全部分类"],
+                            ["none", "未分类"],
+                            ...state.categories.map((c: any) => [
+                              c.id,
+                              c.name,
+                            ]),
+                          ]
+                        : [
+                            ["all", "全部来源"],
+                            ...Object.entries(sourceLabels),
+                          ]
+                    }
+                    onChange={(v) => {
+                      setCategory(v);
                       setSelection([]);
                       setPageIndex(0);
                     }}
-                  >
-                    <option value="all">
-                      {page === "ledger" ? "全部分类" : "全部来源"}
-                    </option>
-                    {page === "ledger" ? (
-                      <>
-                        <option value="none">未分类</option>
-                        {state.categories.map((c: any) => (
-                          <option key={c.id} value={c.id}>
-                            {c.name}
-                          </option>
-                        ))}
-                      </>
-                    ) : (
-                      Object.entries(sourceLabels).map(([key, label]) => (
-                        <option key={key} value={key}>
-                          {label}
-                        </option>
-                      ))
-                    )}
-                  </select>
+                    ariaLabel={page === "ledger" ? "分类筛选" : "来源筛选"}
+                  />
                   {page === "ledger" && (
-                    <select
-                      aria-label="账户筛选"
+                    <FilterMenu
+                      open={openMenu === "account"}
+                      onToggle={() =>
+                        setOpenMenu(
+                          openMenu === "account" ? null : "account",
+                        )
+                      }
+                      label="账户"
                       value={account}
-                      onChange={(e) => {
-                        setAccount(e.target.value);
+                      options={[
+                        ["all", "全部账户"],
+                        ["none", "未指定账户"],
+                        ...state.accounts.map((a: any) => [a.id, a.name]),
+                      ]}
+                      onChange={(v) => {
+                        setAccount(v);
                         setSelection([]);
                         setPageIndex(0);
                       }}
-                    >
-                      <option value="all">全部账户</option>
-                      <option value="none">未指定账户</option>
-                      {state.accounts.map((a: any) => (
-                        <option key={a.id} value={a.id}>
-                          {a.name}
-                        </option>
-                      ))}
-                    </select>
+                      ariaLabel="账户筛选"
+                    />
                   )}
                 </>
               )}
@@ -1187,7 +1195,7 @@ export default function Workspace() {
                     <>
                       <button
                         type="button"
-                        className="button secondary"
+                        className="button secondary record-action"
                         onClick={() => {
                           setPageIndex(0);
                           run(() =>
@@ -1213,7 +1221,7 @@ export default function Workspace() {
                   {page === "ledger" && (
                     <button
                       type="button"
-                      className="button secondary"
+                      className="button record-action record-action-primary"
                       onClick={() => setEditor({ entity: "ledger" })}
                     >
                       <Plus size={16} />
@@ -1223,7 +1231,7 @@ export default function Workspace() {
                   {page === "shopping" && !listId && (
                     <button
                       type="button"
-                      className="button secondary"
+                      className="button secondary record-action"
                       onClick={() => setListWizard(true)}
                     >
                       <Sparkles size={16} />
@@ -1233,7 +1241,7 @@ export default function Workspace() {
                   {page === "shopping" && listId && (
                     <button
                       type="button"
-                      className="button secondary"
+                      className="button record-action record-action-primary"
                       onClick={() =>
                         setEditor({
                           entity: "shopping",
@@ -1248,7 +1256,7 @@ export default function Workspace() {
                   {page === "items" && (
                     <button
                       type="button"
-                      className="button secondary"
+                      className="button secondary record-action"
                       onClick={() =>
                         setItemEditor({
                           defaults: {
@@ -1267,7 +1275,7 @@ export default function Workspace() {
                     !list?.archived && (
                       <button
                         type="button"
-                        className="button"
+                        className="button secondary record-action"
                         onClick={() =>
                           setCapture({ target: "shopping", listId })
                         }
@@ -1282,26 +1290,29 @@ export default function Workspace() {
                       <div className="record-actions-ai">
                         <button
                           type="button"
-                          className="button secondary"
+                          className="text-button"
                           onClick={() => setClassification(true)}
                         >
+                          <Sparkles size={14} />
                           AI 分类
                           {selection.length
                             ? `（${selection.length} 条）`
                             : "未分类记录"}
                         </button>
+                        <span className="record-actions-sep" aria-hidden="true" />
+                        {["ledger", "savings"].includes(page) && (
+                          <a
+                            className="text-button"
+                            href={`/api/export?${csvFilter}`}
+                            download
+                          >
+                            <Download size={14} />
+                            导出当前筛选 CSV
+                          </a>
+                        )}
                         <AiStatus ai={state.ai} compact />
                       </div>
                     </>
-                  )}
-                  {["ledger", "savings"].includes(page) && (
-                    <a
-                      className="button secondary"
-                      href={`/api/export?${csvFilter}`}
-                      download
-                    >
-                      导出当前筛选 CSV
-                    </a>
                   )}
                   {fullGroup !== null && (
                     <button

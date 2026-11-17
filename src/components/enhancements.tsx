@@ -198,7 +198,10 @@ export function GroupControls({
   }
   return (
     <>
-      <button className="button secondary" onClick={() => setOpen(true)}>
+      <button
+        className="button secondary record-action"
+        onClick={() => setOpen(true)}
+      >
         管理分组{selected.length ? ` / 移动 ${selected.length} 条` : ""}
       </button>
       {open && (

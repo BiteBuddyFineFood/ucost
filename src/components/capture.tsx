@@ -438,7 +438,7 @@ export function Capture({
   );
 }
 
-function FilterMenu({
+export function FilterMenu({
   open,
   onToggle,
   label,
